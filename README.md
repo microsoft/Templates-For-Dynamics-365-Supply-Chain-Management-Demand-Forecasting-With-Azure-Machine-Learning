@@ -1,14 +1,12 @@
 # Project
 
-> This repo has been populated by an initial template to help get you started. Please
-> make sure to update the content to build a great experience for community-building.
+This repository contains template scripts that allow to configure Azure subscription resources in order to generate demand forecast using Azure Machine Learning Service which can integreate with Dynamics 365 SCM demand forecasting feature. Please refer to the [official documentation](https://docs.microsoft.com/en-us/dynamics365/supply-chain/master-planning/introduction-demand-forecasting) for more details.
 
-As the maintainer of this project, please make a few updates:
+## Setup guide
 
-- Improving this README.MD file to provide a great experience
-- Updating SUPPORT.MD with content about this project's support experience
-- Understanding the security reporting process in SECURITY.MD
-- Remove this section from the README
+The recommended procedure for setting up an Azure subscription for being able to generate demand forecast is to use setup.ps1 and follow the guide shown by he script.
+An alternative is a manual setup described **TODO:fix the link** [here]().
+
 
 ## Contributing
 
