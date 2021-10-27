@@ -13,7 +13,7 @@ workspace = Workspace.from_config()
 datastore = workspace.get_default_datastore()
 
 # Parameters are passed to the API as a part of submit REST request during a forecasting run.
-input_path_pipeline_param = PipelineParameter(name="input_path", default_value="input.csv")
+input_path_pipeline_param = PipelineParameter(name="input_path", default_value="sampleInput.csv")
 output_path_pipeline_param = PipelineParameter(name="output_path", default_value="output")
 rc = RunConfiguration()
 
@@ -39,7 +39,7 @@ except ErrorResponseException as ex:
 
 
 experiment = Experiment(workspace, 'DemandForecastGeneration_TriggerScript')
-submitParameters = {"input_path": '1AllocationAttribute.csv', "output_path": 'outputs/'+ datetime.now().strftime("%Y%m%dT%H%M%S")}
+submitParameters = {"input_path": 'sampleInput.csv', "output_path": 'outputs/'+ datetime.now().strftime("%Y%m%dT%H%M%S")}
 
 # The block below will either publish new pipeline endpoint or update existing.
 # Pipeline endpoint update is needed in case underlying run.py or forecasting.r scripts are updated.

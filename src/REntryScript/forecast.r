@@ -181,8 +181,13 @@ modelEtsStl <- function(ets_result, stl_result) {
 }
 
 addToOutput <- function(vars_data_frame, granularity_attribute, date_key, transaction_qty, sigma, error_percentage, forecast_model_name) {
-  new_data_frame <- data.frame(GRANULARITYATTRIBUTE = granularity_attribute, DATEKEY = date_key, TRANSACTIONQTY = transaction_qty, SIGMA = sigma, ERRORPERCENTAGE = error_percentage, FORECASTMODELNAME = forecast_model_name)
-  return(rbind(vars_data_frame, new_data_frame));
+    new_data_frame <- data.frame(GRANULARITYATTRIBUTE = granularity_attribute, DATEKEY = date_key, TRANSACTIONQTY = transaction_qty, SIGMA = sigma, ERRORPERCENTAGE = as.numeric(0), FORECASTMODELNAME = "")
+
+    # Put model parameters only in first line for same granularity attribute   
+    new_data_frame$ERRORPERCENTAGE[1] = error_percentage[1]
+    new_data_frame$FORECASTMODELNAME[1] = forecast_model_name[1]
+
+    return(rbind(vars_data_frame, new_data_frame));
 }
 
 trainModels <- function(timeSeriesModel, historicalData, forecastHorizon, confidenceLevel, seasonality, forceSeasonality) {
@@ -232,11 +237,11 @@ trainModels <- function(timeSeriesModel, historicalData, forecastHorizon, confid
 entry_script = new.env()
 
 # This method will be called on init in each worker process.
-entry_script$init<- function(){
+entry_script$init <- function() {
 }
 
 # This method will be called on each minibatch.
-entry_script$run<- function(minibatch){
+entry_script$run <- function(minibatch) {
 
     # Map 1-based optional input ports to variables
     datasetCombined <- minibatch # class: data.frame
@@ -248,20 +253,25 @@ entry_script$run<- function(minibatch){
         colnames(datasetCombined)[i] <- toupper(colnames(datasetCombined)[i])
     }
 
-    print(paste("Generating forecast for granularity attribute: ", datasetCombined$GRANULARITYATTRIBUTE[1], ", length of dataset is: ", length(datasetCombined$GRANULARITYATTRIBUTE)))
+    #First row should have parameter values
+    datasetParameters <- head(datasetCombined, 1)
+
+    data <- datasetCombined
+
+    print(paste("Generating forecast for granularity attribute: ", data$GRANULARITYATTRIBUTE[1], ", length of dataset is: ", length(data$GRANULARITYATTRIBUTE)))
 
     #Number of forecast predictions
-    horizon <- as.numeric(datasetCombined$HORIZON[1])
+    horizon <- as.numeric(datasetParameters$HORIZON)
 
     if (is.na(horizon) || horizon <= 0) {
         stop(paste("Parameter HORIZON must be greater than 0."))
     }
 
     #Seasonality of historical data
-    if (is.null(datasetCombined$SEASONALITY[1])) {
+    if (is.null(datasetParameters$SEASONALITY)) {
         seasonality <- 1;
     } else {
-        seasonality <- as.numeric(datasetCombined$SEASONALITY[1]);
+        seasonality <- as.numeric(datasetParameters$SEASONALITY);
     }
 
     if (is.na(seasonality) || seasonality <= 0) {
@@ -269,11 +279,11 @@ entry_script$run<- function(minibatch){
     }
 
     #Start date key from which forecast should be generated
-    global_max_datekey <- max(datasetCombined$DATEKEY)
-    if (is.null(datasetCombined$FORECAST_START_DATEKEY[1])) {
+    global_max_datekey <- max(data$DATEKEY)
+    if (is.null(datasetParameters$FORECAST_START_DATEKEY)) {
         forecast_start_datekey <- global_max_datekey + 1;
     } else {
-        forecast_start_datekey <- as.numeric(datasetCombined$FORECAST_START_DATEKEY[1]);
+        forecast_start_datekey <- as.numeric(datasetParameters$FORECAST_START_DATEKEY);
 
         if (forecast_start_datekey <= global_max_datekey) {
             stop(paste("Parameter FORECAST_START_DATEKEY must be greater than maximum date key of historical data (", global_max_datekey, ")"))
@@ -281,10 +291,10 @@ entry_script$run<- function(minibatch){
     }
 
     #Time series model
-    if (is.null(datasetCombined$TIME_SERIES_MODEL[1])) {
+    if (is.null(datasetParameters$TIME_SERIES_MODEL)) {
         timeSeriesModel <- TIME_SERIES_MODEL_ALL;
     } else {
-        timeSeriesModel <- toupper(datasetCombined$TIME_SERIES_MODEL[1]);
+        timeSeriesModel <- toupper(datasetParameters$TIME_SERIES_MODEL);
     }
 
     if (is.na(match(timeSeriesModel, TIME_SERIES_MODELS))) {
@@ -292,10 +302,10 @@ entry_script$run<- function(minibatch){
     }
 
     #Confidence level
-    if (is.null(datasetCombined$CONFIDENCE_LEVEL[1])) {
+    if (is.null(datasetParameters$CONFIDENCE_LEVEL)) {
         confidenceLevel <- 95;
     } else {
-        confidenceLevel <- as.numeric(datasetCombined$CONFIDENCE_LEVEL[1]);
+        confidenceLevel <- as.numeric(datasetParameters$CONFIDENCE_LEVEL);
     }
 
     if (is.na(confidenceLevel) || confidenceLevel <= 0 || confidenceLevel >= 100) {
@@ -303,10 +313,10 @@ entry_script$run<- function(minibatch){
     }
 
     #Size of a test set in a percent of a total historical data size
-    if (is.null(datasetCombined$TEST_SET_SIZE_PERCENT[1])) {
+    if (is.null(datasetParameters$TEST_SET_SIZE_PERCENT)) {
         testSetSizePercent <- 20;
     } else {
-        testSetSizePercent <- as.numeric(datasetCombined$TEST_SET_SIZE_PERCENT[1]);
+        testSetSizePercent <- as.numeric(datasetParameters$TEST_SET_SIZE_PERCENT);
     }
 
     if (is.na(testSetSizePercent) || testSetSizePercent < 0 || testSetSizePercent >= 100) {
@@ -314,15 +324,15 @@ entry_script$run<- function(minibatch){
     }
 
     #How gaps in historical data are filled
-    if (is.null(datasetCombined$MISSING_VALUE_SUBSTITUTION[1])) {
+    if (is.null(datasetParameters$MISSING_VALUE_SUBSTITUTION)) {
         missingValueSubstitution <- 0;
     } else {
 
-        if (is.numeric(datasetCombined$MISSING_VALUE_SUBSTITUTION[1])) {
-            missingValueSubstitution <- as.numeric(datasetCombined$MISSING_VALUE_SUBSTITUTION[1])
+        if (is.numeric(datasetParameters$MISSING_VALUE_SUBSTITUTION)) {
+            missingValueSubstitution <- as.numeric(datasetParameters$MISSING_VALUE_SUBSTITUTION)
         }
         else {
-            missingValueSubstitution <- toupper(datasetCombined$MISSING_VALUE_SUBSTITUTION[1])
+            missingValueSubstitution <- toupper(datasetParameters$MISSING_VALUE_SUBSTITUTION)
 
             if (is.na(match(missingValueSubstitution, MISSING_VALUE_OPTIONS))) {
                 stop(paste("Parameter value of MISSING_VALUE_SUBSTITUTION does not represent any known substitution option."))
@@ -331,10 +341,10 @@ entry_script$run<- function(minibatch){
     }
 
     #How are the historical data gaps filled?
-    if (is.null(datasetCombined$MISSING_VALUE_SCOPE[1])) {
+    if (is.null(datasetParameters$MISSING_VALUE_SCOPE)) {
         missingValueScope <- MISSING_VALUE_SCOPE_GRANULARITY_ATTRIBUTE;
     } else {
-        missingValueScope <- toupper(datasetCombined$MISSING_VALUE_SCOPE[1]);
+        missingValueScope <- toupper(datasetParameters$MISSING_VALUE_SCOPE);
     }
 
     if (is.na(match(missingValueScope, MISSING_VALUE_SCOPE_OPTIONS))) {
@@ -342,18 +352,18 @@ entry_script$run<- function(minibatch){
     }
 
     #History date range period
-    global_min_datekey <- min(datasetCombined$DATEKEY)
+    global_min_datekey <- min(data$DATEKEY)
     historyDateRangeFrom <- historyDateRangeTo <- NA
     if (missingValueScope == MISSING_VALUE_SCOPE_HISTORY_DATE_RANGE) {
-        if (is.null(datasetCombined$HISTORY_DATE_RANGE_FROM[1])) {
+        if (is.null(datasetParameters$HISTORY_DATE_RANGE_FROM)) {
             historyDateRangeFrom <- global_min_datekey
         } else {
-            historyDateRangeFrom <- as.numeric(datasetCombined$HISTORY_DATE_RANGE_FROM[1])
+            historyDateRangeFrom <- as.numeric(datasetParameters$HISTORY_DATE_RANGE_FROM)
         }
-        if (is.null(datasetCombined$HISTORY_DATE_RANGE_TO[1])) {
+        if (is.null(datasetParameters$HISTORY_DATE_RANGE_TO)) {
             historyDateRangeTo <- global_max_datekey
         } else {
-            historyDateRangeTo <- as.numeric(datasetCombined$HISTORY_DATE_RANGE_TO[1])
+            historyDateRangeTo <- as.numeric(datasetParameters$HISTORY_DATE_RANGE_TO)
         }
 
         if (historyDateRangeTo < historyDateRangeFrom) {
@@ -362,10 +372,10 @@ entry_script$run<- function(minibatch){
     }
 
     #Seasonality
-    if (is.null(datasetCombined$FORCE_SEASONALITY[1])) {
+    if (is.null(datasetParameters$FORCE_SEASONALITY)) {
         forceSeasonality <- FORCE_SEASONALITY_AUTO;
     } else {
-        forceSeasonality <- toupper(datasetCombined$FORCE_SEASONALITY[1]);
+        forceSeasonality <- toupper(datasetParameters$FORCE_SEASONALITY);
     }
 
     if (is.na(match(forceSeasonality, FORCE_SEASONALITY_OPTIONS))) {
@@ -383,15 +393,15 @@ entry_script$run<- function(minibatch){
         ERRORPERCENTAGE = numeric(0),
         FORECASTMODELNAME = character(0))
 
-    granularityAttributes <- unique(datasetCombined$GRANULARITYATTRIBUTE);
+    granularityAttributes <- unique(data$GRANULARITYATTRIBUTE);
     granularityAttributes_num <- length(granularityAttributes)
 
 
     min_datekey <- max_datekey <- NA
     #Get minimum and maximum date keys
     if (missingValueScope == MISSING_VALUE_SCOPE_GLOBAL) {
-        max_datekey <- max(datasetCombined$DATEKEY)
-        min_datekey <- min(datasetCombined$DATEKEY)
+        max_datekey <- max(data$DATEKEY)
+        min_datekey <- min(data$DATEKEY)
     } else if (missingValueScope == MISSING_VALUE_SCOPE_HISTORY_DATE_RANGE) {
         max_datekey <- historyDateRangeFrom
         min_datekey <- historyDateRangeTo
@@ -400,7 +410,7 @@ entry_script$run<- function(minibatch){
 
     for (i in 1:granularityAttributes_num) {
 
-        granularityAttribute_data <- datasetCombined[which(datasetCombined$GRANULARITYATTRIBUTE == granularityAttributes[i]),]
+        granularityAttribute_data <- data[which(data$GRANULARITYATTRIBUTE == granularityAttributes[i]),]
 
         #Prepare training and test data for given granularity attribute
         granularityAttribute_data <- order_and_fill_missing_values(granularityAttribute_data, missingValueSubstitution, min_datekey, max_datekey)
@@ -506,11 +516,11 @@ entry_script$run<- function(minibatch){
     # Each parallel run step minibatch processing returns an array of string.
     # Lines from all the minibatches are combined into 1 output file.
     result <- paste(
-        paste('"', output$GRANULARITYATTRIBUTE, '"', sep=""),
+        paste('"', output$GRANULARITYATTRIBUTE, '"', sep = ""),
         output$DATEKEY,
         output$TRANSACTIONQTY,
         output$SIGMA,
         output$ERRORPERCENTAGE,
         output$FORECASTMODELNAME,
-        sep=",")
+        sep = ",")
 }
