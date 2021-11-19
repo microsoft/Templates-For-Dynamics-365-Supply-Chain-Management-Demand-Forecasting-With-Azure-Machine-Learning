@@ -4,7 +4,7 @@ This repository contains template scripts that you can use to set up your Azure 
 
 ## Set up your Azure subscription to generate demand forecasts
 
-To enable your Azure subscription to generate demand forecasts, we recommend that you run the `setup.ps1` script included in this repository on your Azure environment and follow the instructions provided by the script. Alternatively, you could set it up manually as described in [Demand forecasting setup](https://go.microsoft.com/fwlink/?linkid=2165514).
+To enable your Azure subscription to generate demand forecasts, we recommend that you run the `quick_setup.ps1` script included in this repository on your Azure environment and follow the instructions provided by the script. Alternatively, you could set it up manually as described in [Demand forecasting setup](https://go.microsoft.com/fwlink/?linkid=2165514).
 
 ## Contributing
 
