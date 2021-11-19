@@ -1,4 +1,4 @@
-# Templates For Dynamics 365 Supply Chain Management demand forecasting with Azure Machine Learning
+# Templates for Dynamics 365 Supply Chain Management demand forecasting with Azure Machine Learning
 
 This repository contains template scripts that you can use to set up your Azure environment to generate demand forecasts using the Azure Machine Learning Service, which you can then integrate with the demand forecasting feature of Dynamics 365 Supply Chain Management. For details, see [Demand forecasting overview](https://docs.microsoft.com/dynamics365/supply-chain/master-planning/introduction-demand-forecasting).
 
