@@ -63,10 +63,10 @@ order_and_fill_missing_values <- function(data, missingValueSubstitution, min_da
         filled_data$TRANSACTIONQTY[is.na(filled_data$TRANSACTIONQTY)] <- mean(filled_data$TRANSACTIONQTY, na.rm = TRUE)
     }
     else if (missingValueSubstitution == MISSING_VALUE_PREVIOUS) {
-        filled_data$TRANSACTIONQTY <- na.locf(filled_data$TRANSACTIONQTY)
+        filled_data$TRANSACTIONQTY <- na.locf(filled_data$TRANSACTIONQTY, na.rm = FALSE)
     }
     else if (missingValueSubstitution == MISSING_VALUE_INTERPOLATION_LINEAR) {
-        filled_data$TRANSACTIONQTY <- na.approx(filled_data$TRANSACTIONQTY)
+        filled_data$TRANSACTIONQTY <- na.approx(filled_data$TRANSACTIONQTY, na.rm = FALSE)
     }
     else if (missingValueSubstitution == MISSING_VALUE_INTERPOLATION_POLYNOMIAL) {
         filled_data$TRANSACTIONQTY <- na.spline(filled_data$TRANSACTIONQTY)
