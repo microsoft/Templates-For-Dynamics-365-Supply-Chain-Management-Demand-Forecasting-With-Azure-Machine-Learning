@@ -88,7 +88,7 @@ def runParallel(inputPath, outputPath):
 
     parallel_run_config = ParallelRunConfig(
         environment=r_env(),
-        entry_script="forecast.R",  # demand forecast generation script to run against each input
+        entry_script="forecast.r",  # demand forecast generation script to run against each input
         partition_keys=['GranularityAttributeKey'],
         error_threshold=-1, # parallel run checks output rows count vs input and throws error if output < input, we need to disable this behavior.
         output_action="append_row", # output of each minibatch run is concatenated into 1 txt file with no column header.
