@@ -1,4 +1,4 @@
-﻿library(forecast)
+library(forecast)
 library(plyr)
 library(zoo)
 
