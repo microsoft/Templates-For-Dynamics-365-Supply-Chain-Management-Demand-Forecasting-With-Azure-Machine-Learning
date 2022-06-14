@@ -451,6 +451,9 @@ entry_script$run <- function(minibatch) {
                 }
             }
 
+            #if for some reason there is still Inf, replace it with -1 that means mape can not be calculated
+            result_mape[is.infinite(result_mape)] <- -1
+
             result <- trainModels(resultTimeSeriesModel, full_data_ts, full_data_horizon_offset, confidenceLevel, seasonality, forceSeasonality)
         }
         else {
