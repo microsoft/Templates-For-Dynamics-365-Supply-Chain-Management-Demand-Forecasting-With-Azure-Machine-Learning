@@ -1,10 +1,8 @@
 ﻿import os
-os.system(f"pip install azureml")
-os.system(f"pip install azureml-core")
-os.system(f"pip install azureml-data")
-os.system(f"pip install azureml-pipeline")
+os.system(f"pip install azureml-core~=1.5")
+os.system(f"pip install azureml-pipeline~=1.5")
 os.system(f"pip install argparse")
-os.system(f"pip install azureml-dataset-runtime[fuse,pandas]")
+os.system(f"pip install azureml-dataset-runtime[fuse,pandas]~=1.5")
 
 from datetime import datetime
 import sys
