@@ -90,7 +90,7 @@ def runParallel(inputPath, outputPath):
         partition_keys=['GranularityAttributeKey'],
         error_threshold=-1, # parallel run checks output rows count vs input and throws error if output < input, we need to disable this behavior.
         output_action="append_row", # output of each minibatch run is concatenated into 1 txt file with no column header.
-        source_directory="src/REntryScript",
+        source_directory="REntryScript",
         description="Generate demand forecast.",
         compute_target=cluster,
         node_count=parameters.nodes_count,
