@@ -1,8 +1,8 @@
 ﻿import os
-os.system(f"pip install azureml-core~=1.5")
-os.system(f"pip install azureml-pipeline~=1.5")
+os.system(f"pip install azureml-core")
+os.system(f"pip install azureml-pipeline")
 os.system(f"pip install argparse")
-os.system(f"pip install azureml-dataset-runtime[fuse,pandas]~=1.5")
+os.system(f"pip install azureml-dataset-runtime[fuse,pandas]")
 
 from datetime import datetime
 import sys
@@ -43,7 +43,7 @@ FROM {DEFAULT_CPU_IMAGE}
 
 # Pin pip version to avoid known ruamel installation issue.
 # https://docs.microsoft.com/en-us/python/api/overview/azure/ml/install?view=azure-ml-py#troubleshooting
-RUN conda install -c r -y pip=20.1.1
+RUN conda install -c r -y pip
 
 # For dataprep.
 RUN pip install azureml-core azureml-dataset-runtime
