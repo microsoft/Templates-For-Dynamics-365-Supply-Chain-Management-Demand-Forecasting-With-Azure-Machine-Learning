@@ -1,8 +1,8 @@
 ﻿import os
-os.system(f"pip install azureml-core==1.51.0")
-os.system(f"pip install azureml-pipeline==1.51.0")
-os.system(f"pip install argparse")
-os.system(f"pip install azureml-dataset-runtime[fuse,pandas]==1.51.0")
+os.system(f"pip install azureml-core==1.53.0")
+os.system(f"pip install azureml-pipeline==1.53.0")
+os.system(f"pip install argparse==1.4.0")
+os.system(f"pip install azureml-dataset-runtime[fuse,pandas]==1.53.0")
 
 from datetime import datetime
 import sys
@@ -62,10 +62,10 @@ FROM {DEFAULT_CPU_IMAGE}
 
 # Pin pip version to avoid known ruamel installation issue.
 # https://docs.microsoft.com/en-us/python/api/overview/azure/ml/install?view=azure-ml-py#troubleshooting
-RUN conda install -c r -y pip
+RUN conda install -c r -y pip=24.0
 
 # For dataprep.
-RUN pip install azureml-core==1.51.0 azureml-dataset-runtime==1.51.0
+RUN pip install azureml-core==1.53.0 azureml-dataset-runtime==1.53.0
 
 # Setup r runtime. Ref: http://cran.rstudio.com/bin/linux/ubuntu/
   RUN apt update -qq -y \
