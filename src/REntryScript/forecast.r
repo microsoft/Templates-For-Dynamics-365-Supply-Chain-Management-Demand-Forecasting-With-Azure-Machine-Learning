@@ -327,11 +327,9 @@ entry_script$run <- function(minibatch) {
     if (is.null(datasetParameters$MISSING_VALUE_SUBSTITUTION)) {
         missingValueSubstitution <- 0;
     } else {
-
-        if (is.numeric(datasetParameters$MISSING_VALUE_SUBSTITUTION)) {
-            missingValueSubstitution <- as.numeric(datasetParameters$MISSING_VALUE_SUBSTITUTION)
-        }
-        else {
+        missingValueSubstitution = strtoi(datasetParameters$MISSING_VALUE_SUBSTITUTION);
+        if (is.na(missingValueSubstitution))
+        {
             missingValueSubstitution <- toupper(datasetParameters$MISSING_VALUE_SUBSTITUTION)
 
             if (is.na(match(missingValueSubstitution, MISSING_VALUE_OPTIONS))) {
