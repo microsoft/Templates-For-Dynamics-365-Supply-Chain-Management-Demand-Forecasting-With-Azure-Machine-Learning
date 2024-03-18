@@ -17,6 +17,7 @@ from azureml.exceptions import ComputeTargetException, ExperimentExecutionExcept
 from azureml.pipeline.core import Pipeline, PipelineData
 from azureml.pipeline.steps import ParallelRunConfig, ParallelRunStep
 from azureml.pipeline.core import PipelineParameter
+from azureml.data.dataset_factory import DataType
 import parameters
 
 def get_input(workspace, inputPath):
