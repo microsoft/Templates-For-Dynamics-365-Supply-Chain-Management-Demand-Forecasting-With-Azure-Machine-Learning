@@ -1,6 +1,6 @@
 ﻿import os
 os.system(f"pip install azureml-core==1.53.0")
-os.system(f"pip install azureml-pipeline==1.53.0")
+os.system(f"pip install azureml-pipeline==1.57.0")
 os.system(f"pip install argparse==1.4.0")
 os.system(f"pip install azureml-dataset-runtime[fuse,pandas]==1.53.0")
 
