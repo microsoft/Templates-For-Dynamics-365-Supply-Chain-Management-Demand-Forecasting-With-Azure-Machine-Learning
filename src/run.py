@@ -1,8 +1,8 @@
 ﻿import os
-os.system(f"pip install azureml-core==1.53.0")
+os.system(f"pip install azureml-core==1.57.0")
 os.system(f"pip install azureml-pipeline==1.57.0")
 os.system(f"pip install argparse==1.4.0")
-os.system(f"pip install azureml-dataset-runtime[fuse,pandas]==1.53.0")
+os.system(f"pip install azureml-dataset-runtime[fuse,pandas]==1.57.0")
 
 from datetime import datetime
 import sys
@@ -66,7 +66,7 @@ FROM {DEFAULT_CPU_IMAGE}
 RUN conda install -c r -y pip=24.0
 
 # For dataprep.
-RUN pip install azureml-core==1.53.0 azureml-dataset-runtime==1.53.0
+RUN pip install azureml-core==1.57.0 azureml-dataset-runtime==1.57.0
 
 # Setup r runtime. Ref: http://cran.rstudio.com/bin/linux/ubuntu/
   RUN apt update -qq -y \
