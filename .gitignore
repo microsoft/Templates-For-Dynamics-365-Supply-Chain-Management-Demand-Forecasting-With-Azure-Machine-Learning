@@ -1,0 +1,13 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Azure Functions local build / runtime artifacts
+relay/.python_packages/
+relay/bin/
+relay/obj/
+relay/src/
+
+# Local packaging / build outputs
+*.zip
+src/r_env_context/
