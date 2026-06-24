@@ -6,13 +6,7 @@
 # cluster should have 11 nodes (1 node will be used to initiate the run).
 # In case nodes_count is set higher than available in the cluster the run might be queued until more
 # resources are available.
-# NOTE on quota: the cluster 'e2ecpucluster' is created by quick_setup.ps1 as
-# Standard_DS3_v2 (4 vCPUs per node) with max 6 nodes. However the subscription's
-# Standard DSv2-family vCPU quota may be much smaller. With a 6-vCPU quota, only
-# ONE node fits (4 vCPUs; two nodes = 8 vCPUs exceeds 6), so nodes_count must be 1.
-# To run more nodes in parallel, either request a DSv2 quota increase in the Azure
-# portal (Usage + quotas) or reduce the per-node size. 20 vCPUs are needed for 5.
-nodes_count = 1
+nodes_count = 5
 
 # The compute cluster to use for running the pipelines.
 compute_cluster_name = "e2ecpucluster"
