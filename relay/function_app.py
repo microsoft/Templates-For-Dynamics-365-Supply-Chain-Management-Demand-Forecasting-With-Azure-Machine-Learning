@@ -79,10 +79,14 @@ def _client():
 
 def _validate_token(req):
     """Verify the caller's AAD bearer token (issuer tenant + app id). The token's
-    audience is AML, not this app, so audience is not checked. Disabled when the
-    expected tenant/app id env vars are not set."""
+    audience is AML, not this app, so audience is not checked. Fails closed: if the
+    expected tenant/app id are not configured, the request is rejected."""
     if not (_EXPECTED_TENANT and _EXPECTED_APP_ID):
-        return
+        raise _Unauthorized(
+            "Caller validation is not configured. Set the RELAY_EXPECTED_TENANT_ID "
+            "and RELAY_EXPECTED_APP_ID app settings to the D365 service principal's "
+            "tenant id and application id."
+        )
 
     auth = req.headers.get("Authorization", "")
     if not auth.lower().startswith("bearer "):
@@ -150,9 +154,12 @@ def _submit(req):
     api_trigger._REGISTERED_CODE = _code_asset
 
     input_uri = f"azureml://datastores/{_DATASTORE}/paths/{input_path}"
-    # read_into_memory=False -> the MLTable references the blob directly, avoiding a
-    # slow synchronous read of the full input at submit time (large-input safe).
-    input_asset = api_trigger.register_mltable_asset(ml, input_uri, read_into_memory=False)
+    # read_into_memory=False -> the MLTable references the blob directly (no slow
+    # synchronous read). register=False -> inline input, so no data-asset version is
+    # created per forecast.
+    input_asset = api_trigger.register_mltable_asset(
+        ml, input_uri, read_into_memory=False, register=False
+    )
 
     # ForecastClient reads {output_path}/parallel_run_step.txt, so target that file.
     output_uri = (
@@ -177,6 +184,27 @@ def _cancel(run_id):
     except Exception as exc:  # noqa: BLE001
         logging.warning("Cancel of %s failed: %s", run_id, exc)
     return func.HttpResponse(status_code=200)
+
+
+def _query(experiment):
+    """Return the experiment's active (non-terminal) parent runs so ForecastClient
+    cancels them before submitting -- matching the v1 endpoint's behaviour. Scans
+    only the most recent jobs to bound the cost (an in-flight run is recent)."""
+    terminal = ("completed", "failed", "canceled", "cancelled")
+    active = []
+    scanned = 0
+    for job in _client().jobs.list():
+        scanned += 1
+        if scanned > 200:
+            break
+        if getattr(job, "experiment_name", None) != experiment:
+            continue
+        if getattr(job, "parent_job_name", None):
+            continue
+        if (getattr(job, "status", "") or "").lower() in terminal:
+            continue
+        active.append({"runId": job.name})
+    return _json({"value": active})
 
 
 app = func.FunctionApp()
@@ -213,9 +241,9 @@ def history(req: func.HttpRequest) -> func.HttpResponse:
         details = re.search(r"/runs/([^/]+)/details$", path)
         if details and req.method == "GET":
             return _status(details.group(1))
-        if path.endswith("runs:query"):
-            # D365 cancels active runs before each submit; report none to cancel.
-            return _json({"value": []})
+        query = re.search(r"/experiments/([^/]+)/runs:query$", path)
+        if query and req.method == "POST":
+            return _query(query.group(1))
         return _json({"error": f"Unmatched history route: {path}"}, 404)
     except Exception as exc:  # noqa: BLE001
         return _error(exc)

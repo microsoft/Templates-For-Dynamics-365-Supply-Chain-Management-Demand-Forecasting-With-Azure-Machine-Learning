@@ -81,8 +81,9 @@ def _expand_datastore_uri(ml_client: MLClient, uri: str) -> str:
     )
 
 
-def register_mltable_asset(ml_client: MLClient, csv_datastore_uri: str, read_into_memory: bool = True):
-    """Build an MLTABLE asset around the input CSV and register it; return its id.
+def register_mltable_asset(ml_client: MLClient, csv_datastore_uri: str, read_into_memory: bool = True, register: bool = True):
+    """Build an MLTABLE around the input CSV; return a registered asset id or, when
+    register=False, the local MLTable folder path (used inline as a job input).
 
     A flat (single-file) MLTable is enough here: the parallel job feeds the whole
     table to run() as one mini-batch and entry.py groups it by GranularityAttributeKey
@@ -92,6 +93,9 @@ def register_mltable_asset(ml_client: MLClient, csv_datastore_uri: str, read_int
     read_into_memory=True reads + rewrites one self-contained data.csv (robust for
     hand-edited inputs). Set it False for large inputs (e.g. from the relay) to make
     the MLTable reference the source blob directly and skip the slow synchronous read.
+
+    register=False returns the local MLTable folder so the caller can pass it as an
+    inline job input -- avoids creating a new data-asset version on every forecast.
     """
     import shutil
     import tempfile
@@ -135,6 +139,11 @@ def register_mltable_asset(ml_client: MLClient, csv_datastore_uri: str, read_int
             infer_column_types=False,
         )
     tbl.save(mltable_dir)
+
+    if not register:
+        # Inline input: the job uploads this small MLTable folder per submit (no
+        # named data-asset version churn). The MLTable references the source blob.
+        return mltable_dir
 
     name = "demand-forecast-input"
     data_ops = getattr(ml_client, "data", None) or ml_client._data
