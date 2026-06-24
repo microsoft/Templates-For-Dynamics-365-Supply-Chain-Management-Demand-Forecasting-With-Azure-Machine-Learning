@@ -425,10 +425,22 @@ function Set-RelayAppSettings {
         "AML_WORKSPACE_NAME=$workspaceName",
         "RELAY_DATASTORE=$workspaceBlobDS"
     )
-    if ($d365TenantId -and $d365AppId) {
-        $settings += "RELAY_EXPECTED_TENANT_ID=$d365TenantId"
-        $settings += "RELAY_EXPECTED_APP_ID=$d365AppId"
+
+    # The relay is fail-closed: it rejects callers unless the expected tenant + app
+    # id are set. Default them to the service principal this script provisions (the
+    # same Application id printed for the D365 Demand forecasting parameters page);
+    # -d365TenantId / -d365AppId override when D365 authenticates as a different principal.
+    $expectedTenant = if ($d365TenantId) { $d365TenantId } else { az account show --query tenantId --output tsv }
+    $expectedAppId = if ($d365AppId) { $d365AppId } elseif ($appId) { $appId } elseif ($AADApplicationName) { az ad app list --display-name $AADApplicationName --query "[0].appId" --output tsv }
+
+    if ($expectedTenant -and $expectedAppId) {
+        $settings += "RELAY_EXPECTED_TENANT_ID=$expectedTenant"
+        $settings += "RELAY_EXPECTED_APP_ID=$expectedAppId"
     }
+    else {
+        Write-Warning "Could not determine the relay's expected tenant/app id; it will reject D365 calls until RELAY_EXPECTED_TENANT_ID and RELAY_EXPECTED_APP_ID are set (re-run with -d365TenantId and -d365AppId, or -AADApplicationName)."
+    }
+
     az functionapp config appsettings set --name $functionAppName --resource-group $resourceGroupName --settings $settings | Out-Null
 }
 
