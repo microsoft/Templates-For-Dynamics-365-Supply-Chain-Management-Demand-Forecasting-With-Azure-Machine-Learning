@@ -1,0 +1,13 @@
+# Azure Functions Python worker
+azure-functions
+
+# Reused by the relay to build/submit the v2 forecast pipeline (same set the
+# pipeline/job environment needs to read the MLTable input).
+azure-ai-ml
+azure-identity
+mltable
+azureml-dataprep[pandas]
+pandas
+
+# AAD bearer-token validation of the D365 caller (function_app._validate_token).
+PyJWT[crypto]

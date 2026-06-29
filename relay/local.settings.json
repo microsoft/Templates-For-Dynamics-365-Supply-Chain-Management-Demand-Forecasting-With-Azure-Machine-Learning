@@ -1,0 +1,13 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+    "FUNCTIONS_WORKER_RUNTIME": "python",
+    "AML_SUBSCRIPTION_ID": "<subscription-id>",
+    "AML_RESOURCE_GROUP": "<resource-group>",
+    "AML_WORKSPACE_NAME": "<workspace-name>",
+    "RELAY_DATASTORE": "workspaceblobdemplan",
+    "RELAY_EXPECTED_TENANT_ID": "<d365-service-principal-tenant-id>",
+    "RELAY_EXPECTED_APP_ID": "<d365-service-principal-app-id>"
+  }
+}
