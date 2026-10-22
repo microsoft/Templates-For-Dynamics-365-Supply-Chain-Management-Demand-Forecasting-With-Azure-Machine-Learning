@@ -13,7 +13,7 @@ Data flows through blob storage (container demplan-azureml): D365 uploads the
 merged input CSV and reads {output_path}/parallel_run_step.txt, so the submit
 handler points the v2 job's output at that exact file.
 
-The forecast pipeline itself is unchanged -- this reuses api_trigger's builders.
+The forecast pipeline is built by api_trigger's builders (reused as-is).
 """
 import json
 import logging
@@ -153,12 +153,12 @@ def _submit(req):
         _code_asset = api_trigger.register_code_asset(ml)
     api_trigger._REGISTERED_CODE = _code_asset
 
-    input_uri = f"azureml://datastores/{_DATASTORE}/paths/{input_path}"
-    # read_into_memory=False -> the MLTable references the blob directly (no slow
-    # synchronous read). register=False -> inline input, so no data-asset version is
-    # created per forecast.
-    input_asset = api_trigger.register_mltable_asset(
-        ml, input_uri, read_into_memory=False, register=False
+    # Expand to the long datastore URI form (the short form can fail with NotFound on
+    # compute). The pipeline's first step partitions this CSV by forecast series, so
+    # the relay no longer needs mltable / azureml-dataprep (whose native rslex library
+    # fails to load on the Python 3.11 Functions image: __libc_single_threaded).
+    input_uri = api_trigger._expand_datastore_uri(
+        ml, f"azureml://datastores/{_DATASTORE}/paths/{input_path}"
     )
 
     # ForecastClient reads {output_path}/parallel_run_step.txt, so target that file.
@@ -166,7 +166,7 @@ def _submit(req):
         f"azureml://datastores/{_DATASTORE}/paths/"
         f"{output_path.rstrip('/')}/parallel_run_step.txt"
     )
-    job = api_trigger.build_pipeline_job(input_asset, output_uri)
+    job = api_trigger.build_pipeline_job(input_uri, output_uri)
     submitted = ml.jobs.create_or_update(job, experiment_name=experiment)
 
     logging.info("Submitted pipeline job %s (experiment %s)", submitted.name, experiment)

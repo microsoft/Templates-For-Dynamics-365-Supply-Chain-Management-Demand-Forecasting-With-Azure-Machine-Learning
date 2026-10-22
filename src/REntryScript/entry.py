@@ -45,6 +45,9 @@ def run(mini_batch):
     if mini_batch is None or len(mini_batch) == 0:
         return []
 
+    # Added by partition.py to form the mini-batches; forecast.r must not see it.
+    mini_batch = mini_batch.drop(columns=["PartitionBucket"], errors="ignore")
+
     key = "GranularityAttributeKey"
     if key in mini_batch.columns:
         groups = [g for _, g in mini_batch.groupby(key, sort=False)]

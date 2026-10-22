@@ -5,16 +5,15 @@ MLClient + an @pipeline DSL job + components.create_or_update. The parallel job 
 a first-class pipeline step (no nested-pipeline indirection).
 """
 import argparse
-import os
 from datetime import datetime
 
 from azure.ai.ml import MLClient, Input
-from azure.ai.ml.constants import AssetTypes, InputOutputModes
+from azure.ai.ml.constants import AssetTypes
 from azure.ai.ml.dsl import pipeline
 from azure.identity import DefaultAzureCredential
 
 import parameters
-from run import build_parallel_job, _R_SOURCE_DIR
+from run import build_parallel_job, build_partition_step, _R_SOURCE_DIR
 
 # Holds the registered code-asset reference (set by register_code_asset) so the
 # @pipeline-decorated function can read it when building the parallel step.
@@ -81,100 +80,6 @@ def _expand_datastore_uri(ml_client: MLClient, uri: str) -> str:
     )
 
 
-def register_mltable_asset(ml_client: MLClient, csv_datastore_uri: str, read_into_memory: bool = True, register: bool = True):
-    """Build an MLTABLE around the input CSV; return a registered asset id or, when
-    register=False, the local MLTable folder path (used inline as a job input).
-
-    A flat (single-file) MLTable is enough here: the parallel job feeds the whole
-    table to run() as one mini-batch and entry.py groups it by GranularityAttributeKey
-    at runtime. infer_column_types=False so the parallel harness reads the sparse
-    parameter columns as plain strings (otherwise it mis-infers e.g. 0 -> 0.0/False).
-
-    read_into_memory=True reads + rewrites one self-contained data.csv (robust for
-    hand-edited inputs). Set it False for large inputs (e.g. from the relay) to make
-    the MLTable reference the source blob directly and skip the slow synchronous read.
-
-    register=False returns the local MLTable folder so the caller can pass it as an
-    inline job input -- avoids creating a new data-asset version on every forecast.
-    """
-    import shutil
-    import tempfile
-
-    import mltable
-    from azure.ai.ml.entities._assets import Data
-
-    # Expand to the long URI form (the short form can fail with NotFound on compute).
-    csv_datastore_uri = _expand_datastore_uri(ml_client, csv_datastore_uri)
-
-    mltable_dir = os.path.join(tempfile.gettempdir(), "demand_forecast_mltable")
-    if os.path.exists(mltable_dir):
-        shutil.rmtree(mltable_dir)
-    os.makedirs(mltable_dir, exist_ok=True)
-
-    if read_into_memory:
-        # Read the source CSV and write it back as a single local data.csv so the
-        # MLTable is fully self-contained, then build the MLTable over that file.
-        df = mltable.from_delimited_files(
-            [{"file": csv_datastore_uri}],
-            delimiter=",",
-            header="all_files_same_headers",
-            encoding="utf8",
-            infer_column_types=False,
-        ).to_pandas_dataframe()
-        df.to_csv(os.path.join(mltable_dir, "data.csv"), index=False)
-        tbl = mltable.from_delimited_files(
-            paths=[{"pattern": os.path.join(mltable_dir, "*.csv").replace("\\", "/")}],
-            delimiter=",",
-            header="all_files_same_headers",
-            encoding="utf8",
-            infer_column_types=False,
-        )
-    else:
-        # Fast path: reference the source blob directly (no full read at submit time).
-        tbl = mltable.from_delimited_files(
-            [{"file": csv_datastore_uri}],
-            delimiter=",",
-            header="all_files_same_headers",
-            encoding="utf8",
-            infer_column_types=False,
-        )
-    tbl.save(mltable_dir)
-
-    if not register:
-        # Inline input: the job uploads this small MLTable folder per submit (no
-        # named data-asset version churn). The MLTable references the source blob.
-        return mltable_dir
-
-    name = "demand-forecast-input"
-    data_ops = getattr(ml_client, "data", None) or ml_client._data
-    last_error = None
-    for v in range(1, 10001):
-        version = str(v)
-        try:
-            data_ops.get(name=name, version=version)
-            continue  # exists -> next integer
-        except Exception:
-            pass
-        try:
-            data_asset = Data(
-                name=name,
-                version=version,
-                type=AssetTypes.MLTABLE,
-                path=mltable_dir,
-                description="MLTable for the demand forecast input (grouped by key in the entry script).",
-            )
-            registered = data_ops.create_or_update(data_asset)
-            if getattr(registered, "id", None):
-                return registered.id
-            return f"azureml:{registered.name}:{registered.version}"
-        except Exception as e:
-            last_error = e
-            continue
-    raise RuntimeError(
-        f"Could not register MLTable data asset '{name}'; last error: {last_error}"
-    )
-
-
 def get_ml_client() -> MLClient:
     """Construct an MLClient (parameters.py values, else MLClient.from_config())."""
     credential = DefaultAzureCredential()
@@ -194,21 +99,20 @@ def get_ml_client() -> MLClient:
     default_compute=parameters.compute_cluster_name,
 )
 def demand_forecast_pipeline(input_data: Input):
-    """Pipeline wrapping the single R parallel job step."""
-    forecast_step = build_parallel_job(
+    """Partition the input by forecast series, then forecast each bucket in parallel."""
+    partition_step = build_partition_step(
         input_data=input_data, code_asset=_REGISTERED_CODE
+    )
+    forecast_step = build_parallel_job(
+        input_data=partition_step.outputs.partitioned_data,
+        code_asset=_REGISTERED_CODE,
     )
     return {"pipeline_output": forecast_step.outputs.job_output_path}
 
 
-def build_pipeline_job(input_asset_id: str, output_path: str):
-    """Instantiate the pipeline job. input_asset_id is the registered MLTABLE asset."""
-    # DIRECT mode so the parallel run() receives each partition as a DataFrame.
-    pipeline_input = Input(
-        type=AssetTypes.MLTABLE,
-        path=input_asset_id,
-        mode=InputOutputModes.DIRECT,
-    )
+def build_pipeline_job(input_uri: str, output_path: str):
+    """Instantiate the pipeline job. input_uri is the datastore URI of the input CSV."""
+    pipeline_input = Input(type=AssetTypes.URI_FILE, path=input_uri)
     job = demand_forecast_pipeline(input_data=pipeline_input)
     job.settings.default_compute = parameters.compute_cluster_name
     # Single concatenated output file (matches v1 append_row).
@@ -224,7 +128,7 @@ def main():
         "--input_path",
         default="azureml://datastores/workspaceblobdemplan/paths/sampleInput.csv",
         help="Datastore URI of the input CSV (path relative to the container root). "
-        "An MLTABLE asset is built around it automatically.",
+        "The pipeline partitions it by forecast series automatically.",
     )
     parser.add_argument(
         "--output_path",
@@ -251,9 +155,8 @@ def main():
     _REGISTERED_CODE = register_code_asset(ml_client)
     print(f"Registered code asset: {_REGISTERED_CODE}")
 
-    # Wrap the input CSV in an MLTABLE asset for the parallel job's tabular input.
-    input_asset_id = register_mltable_asset(ml_client, args.input_path)
-    print(f"Registered input MLTable asset: {input_asset_id}")
+    # Expand short datastore URIs to the long form (see _expand_datastore_uri).
+    input_uri = _expand_datastore_uri(ml_client, args.input_path)
 
     default_output = (
         args.output_path
@@ -276,7 +179,7 @@ def main():
     if args.no_submit:
         return
 
-    job = build_pipeline_job(input_asset_id, default_output)
+    job = build_pipeline_job(input_uri, default_output)
     submitted = ml_client.jobs.create_or_update(
         job, experiment_name="DemandForecastGeneration_TriggerScript"
     )

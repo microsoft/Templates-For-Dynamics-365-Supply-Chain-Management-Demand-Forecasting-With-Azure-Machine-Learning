@@ -1,13 +1,17 @@
-"""Builds the demand-forecast parallel job (Azure ML SDK v2).
+"""Builds the demand-forecast pipeline steps (Azure ML SDK v2).
 
 v2 parallel jobs only support a Python entry script (init/run), not an R one like
 the v1 ParallelRunStep. entry.py is a small Python shim that forwards each
 mini-batch to the unchanged forecast.r via Rscript.
+
+partition.py (a command step) first splits the input into series-preserving
+buckets, mirroring v1's partition_by + partition_keys, so the parallel step gets
+one bounded mini-batch per bucket.
 """
 import os
 import tempfile
 
-from azure.ai.ml import Input, Output
+from azure.ai.ml import Input, Output, command
 from azure.ai.ml.constants import AssetTypes, InputOutputModes
 from azure.ai.ml.entities import Environment, BuildContext
 from azure.ai.ml.parallel import parallel_run_function, RunFunction
@@ -18,9 +22,19 @@ import parameters
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _R_SOURCE_DIR = os.path.join(_THIS_DIR, "REntryScript")
 
+# Column written by partition.py; each distinct value becomes one mini-batch.
+PARTITION_KEY = "PartitionBucket"
+
+_ENVIRONMENT = None
+
 
 def r_environment() -> Environment:
     """Return the R runtime environment (custom Docker image: R + forecast/plyr/zoo)."""
+    # Built once per process so both pipeline steps share one environment object.
+    global _ENVIRONMENT
+    if _ENVIRONMENT is not None:
+        return _ENVIRONMENT
+
     # Write the build context to a writable temp dir -- the deployed code dir is
     # read-only when this runs inside the relay Function (/home/site/wwwroot).
     build_dir = os.path.join(tempfile.gettempdir(), "demand_forecast_r_env")
@@ -32,11 +46,12 @@ def r_environment() -> Environment:
     with open(dockerfile_path, "w", encoding="utf-8") as f:
         f.write(_R_DOCKERFILE)
 
-    return Environment(
+    _ENVIRONMENT = Environment(
         name="demand-forecast-r-parallel",
         description="R runtime (forecast, plyr, zoo) for demand forecast parallel job.",
         build=BuildContext(path=os.path.relpath(build_dir, os.getcwd())),
     )
+    return _ENVIRONMENT
 
 
 # Same R packages as the v1 template, on a current AzureML CPU base image.
@@ -68,18 +83,44 @@ RUN r -e 'install.packages("zoo", repos = "http://cran.us.r-project.org")'
 """
 
 
+def _code_value(code_asset):
+    if code_asset is not None:
+        return code_asset
+    # Local path fallback (newer SDKs / offline construction).
+    return "." + os.sep + os.path.relpath(_R_SOURCE_DIR, os.getcwd())
+
+
+def build_partition_step(input_data, code_asset=None):
+    """Create the command step that splits the input CSV into series-preserving
+    buckets and emits a partitioned MLTable (see partition.py)."""
+    partition_step = command(
+        name="partition_input",
+        display_name="Partition input by forecast series",
+        description="Split the input into buckets that keep each forecast series whole.",
+        inputs=dict(input_data=Input(type=AssetTypes.URI_FILE)),
+        outputs=dict(partitioned_data=Output(type=AssetTypes.MLTABLE)),
+        code=_code_value(code_asset),
+        command=(
+            "python partition.py"
+            " --input_data ${{inputs.input_data}}"
+            " --output_data ${{outputs.partitioned_data}}"
+            f" --max_series_per_partition {parameters.max_series_per_partition}"
+            f" --max_partition_output_bytes {parameters.max_partition_output_bytes}"
+        ),
+        environment=r_environment(),
+    )
+    return partition_step(input_data=input_data)
+
+
 def build_parallel_job(input_data, output_data=None, code_asset=None):
     """Create the demand-forecast parallel job (v2).
 
+    input_data must be the partitioned MLTable produced by build_partition_step.
     code_asset: a pre-registered code-asset id for the R folder. Some SDK versions
     reject an inline local path for task.code, so api_trigger.py registers it and
     passes the id here; falls back to a local path when None.
     """
-    if code_asset is not None:
-        code_value = code_asset
-    else:
-        # Local path fallback (newer SDKs / offline construction).
-        code_value = "." + os.sep + os.path.relpath(_R_SOURCE_DIR, os.getcwd())
+    code_value = _code_value(code_asset)
 
     parallel_job = parallel_run_function(
         name="r_forecast",
@@ -88,7 +129,7 @@ def build_parallel_job(input_data, output_data=None, code_asset=None):
         inputs=dict(
             job_data_path=Input(
                 type=AssetTypes.MLTABLE,
-                description="Partitioned historical data to forecast in parallel.",
+                description="Historical data partitioned by PartitionBucket.",
             )
         ),
         outputs=dict(
@@ -96,12 +137,13 @@ def build_parallel_job(input_data, output_data=None, code_asset=None):
             job_output_path=Output(type=AssetTypes.URI_FILE)
         ),
         input_data="${{inputs.job_data_path}}",
-        # Feed the whole (small) tabular input as a single mini-batch; entry.py
-        # groups it by GranularityAttributeKey and forecasts each key. (partition_keys
-        # did not group reliably here -- the harness produced 1 default partition
-        # "000000000" with 0 rows per task.)
-        mini_batch_size="500mb",
+        # One mini-batch per bucket; a bucket always holds whole series, so the
+        # per-mini-batch output appended to the result file stays small (v1 used
+        # partition_keys=['GranularityAttributeKey'] the same way).
+        partition_keys=[PARTITION_KEY],
         instance_count=parameters.nodes_count,
+        max_concurrency_per_instance=parameters.processes_per_node,
+        retry_settings=dict(timeout=parameters.mini_batch_timeout_seconds),
         # Ignore item-level failures (output rows < input rows is expected here).
         error_threshold=-1,
         # Fail the run if any mini-batch fails.
