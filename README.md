@@ -20,30 +20,7 @@ Supply Chain Management's demand forecasting connector calls an Azure Machine Le
 - `relay/` – the Azure Function that bridges Supply Chain Management to the v2 pipeline.
 - `sampleInput.csv` – sample input used to validate the setup.
 
-### Relay Python runtime
-
-`quick_setup.ps1` creates new Linux Consumption relay apps with **Python 3.12** and Functions v4. On every run (including `-RelayOnly`), it inspects the existing app's operating system, hosting plan, worker and runtime. It verifies Python 3.12 before deploying, and uses `az functionapp config set --linux-fx-version "Python|3.12"` to update managed Python apps on supported Premium or Dedicated plans. An update restarts the app; schedule production updates during a maintenance window.
-
-Azure Functions [does not support changing Python versions on existing Linux Consumption apps](https://learn.microsoft.com/azure/azure-functions/update-language-versions?pivots=programming-language-python). If an existing Consumption relay uses Python 3.11, setup stops with an explicit error rather than silently reusing it or claiming an unsupported upgrade succeeded. Provision a new Python 3.12 relay using a different `-functionAppName`, then replace the D365 pipeline endpoint with the newly printed URL after validation. Alternatively, plan a supported hosting migration separately. Setup never deletes the old app. Flex Consumption has a [different deployment contract](https://learn.microsoft.com/azure/azure-functions/flex-consumption-plan#deployment) and is not supported by this script's zip-deploy workflow; Windows, container-based, non-Python and non-v4 apps also require separate migration.
-
-### Complete-history dispatch
-
-The pipeline keeps preparation and forecasting in **one pipeline job**. Its first command step materializes one CSV per `GranularityAttributeKey`, preserving source row order, string values and sparse first-row forecast parameters. It writes an MLTable with `extract_columns_from_partition_format` metadata, following the [official SDK v2 partition-by-key example](https://github.com/Azure/azureml-examples/tree/main/cli/jobs/parallel/1a_oj_sales_prediction). The parallel step consumes this MLTable in `direct` mode with `partition_keys=["GranularityAttributeKey"]`, so an individual key's history is not split by a size-based mini-batch.
-
-D365's integer keys remain strings (including leading zeros). Preparation rejects missing, empty or unsafe path keys rather than silently dropping rows or normalizing distinct keys into the same directory; supported key strings contain letters, digits, `_` or `-`. Preparation loads the source history into memory on one compute node, which must have sufficient memory for the input. The R forecasting model, per-key parameter handling and headerless appended output remain unchanged. The relay still writes to `{output_path}/parallel_run_step.txt`.
-
-Key partitioning reduces the amount returned by an individual parallel call compared with returning all forecasts together. It does **not** establish that every `RequestBodyTooLarge` case is resolved; a large single-key forecast or another service payload can still exceed limits. Validate representative workloads in Azure ML before production use.
-
-### Focused local checks
-
-In a Python 3.12 environment with `azure-ai-ml`, `mltable` and `azureml-dataprep[pandas]` installed, run:
-
-```powershell
-python -m unittest discover -s tests -p test_forecast_partitioning.py
-pwsh -NoProfile -File .\tests\test_function_runtime.ps1
-```
-
-These checks exercise real local MLTable preparation and SDK pipeline serialization, a mocked R process, and mocked Azure CLI runtime scenarios. They do not deploy resources, run R models, or verify cloud dispatch, remote Function builds or production forecasts.
+New relay Function apps use Python 3.12; rerunning setup does not change an existing app's Python version. The parallel job requests partitioning by `GranularityAttributeKey` without changing input preparation. Validate key dispatch in Azure ML before production use; this configuration change alone does not establish that `RequestBodyTooLarge` is resolved.
 
 ## Contributing
 

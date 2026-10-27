@@ -39,8 +39,8 @@ def init():
 
 
 def run(mini_batch):
-    # Prepared path partitions keep each key's full history in one mini-batch.
-    # Group the DataFrame so each forecast.r call gets ONE key -- forecast.r reads its
+    # The harness hands a pandas DataFrame. Group by GranularityAttributeKey so
+    # each forecast.r call gets ONE key's full history -- forecast.r reads its
     # parameters from the first row, so different keys must not be mixed in a call.
     if mini_batch is None or len(mini_batch) == 0:
         return []
