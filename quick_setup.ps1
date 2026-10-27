@@ -380,21 +380,74 @@ function Ensure-FunctionStorage {
 }
 
 function Ensure-FunctionApp {
-    $exists = az functionapp show --name $functionAppName --resource-group $resourceGroupName --query "name" --output tsv 2>$null
-    if ($exists) {
+    $targetRuntime = "Python|3.12"
+    # A failed lookup is not evidence that the app is missing (for example, RBAC).
+    $appsJson = az functionapp list --resource-group $resourceGroupName --output json
+    if ($LASTEXITCODE -ne 0) { throw "Could not list Function apps in $resourceGroupName." }
+    $app = @($appsJson | ConvertFrom-Json) | Where-Object { $_.name -eq $functionAppName }
+    if ($app) {
         Write-Host "Function app $functionAppName already exists."
     }
     else {
-        Write-Host "Creating a Function app $functionAppName (Linux, Python 3.11, Consumption) ..."
+        Write-Host "Creating a Function app $functionAppName (Linux, Python 3.12, Consumption) ..."
         $res = az functionapp create --name $functionAppName --resource-group $resourceGroupName `
             --storage-account $functionStorageAccountName --consumption-plan-location $location `
-            --os-type Linux --runtime python --runtime-version 3.11 --functions-version 4
-        if ($LASTEXITCODE -ne 0) { throw $res }
+            --os-type Linux --runtime python --runtime-version 3.12 --functions-version 4
+        if ($LASTEXITCODE -ne 0) { throw "Could not create Function app $functionAppName. $res" }
+        $appJson = az functionapp show --name $functionAppName --resource-group $resourceGroupName --output json
+        if ($LASTEXITCODE -ne 0) { throw "Could not inspect the created Function app $functionAppName." }
+        $app = $appJson | ConvertFrom-Json
     }
+
+    if (-not $app.reserved -or -not $app.serverFarmId -or $app.kind -notmatch 'functionapp') {
+        throw "The relay requires a Linux Function app with a hosting plan. Inspect $functionAppName before redeploying."
+    }
+    $planJson = az appservice plan show --ids $app.serverFarmId --output json
+    if ($LASTEXITCODE -ne 0) { throw "Could not inspect the hosting plan for $functionAppName." }
+    $plan = $planJson | ConvertFrom-Json
+    if ($plan.sku.tier -eq "FlexConsumption" -or $plan.sku.name -eq "FC1") {
+        throw "Flex Consumption uses a different runtime configuration and deployment contract; this zip-deploy setup does not support it. Use a supported Linux Consumption, Premium or Dedicated relay app."
+    }
+    $supportedTiers = @("Dynamic", "ElasticPremium", "Basic", "Standard", "Premium", "PremiumV2", "PremiumV3", "PremiumV4", "Isolated", "IsolatedV2")
+    if ($plan.sku.tier -notin $supportedTiers) {
+        throw "Unsupported or unknown Function hosting tier '$($plan.sku.tier)'; no runtime changes were made."
+    }
+
+    $settingsJson = az functionapp config appsettings list --name $functionAppName --resource-group $resourceGroupName --output json
+    if ($LASTEXITCODE -ne 0) { throw "Could not inspect Function runtime settings for $functionAppName." }
+    $settings = $settingsJson | ConvertFrom-Json
+    $worker = ($settings | Where-Object { $_.name -eq "FUNCTIONS_WORKER_RUNTIME" }).value
+    $hostVersion = ($settings | Where-Object { $_.name -eq "FUNCTIONS_EXTENSION_VERSION" }).value
+    if ($worker -ne "python" -or $hostVersion -notmatch '^~?4(\.|$)') {
+        throw "The relay requires the Python worker on Functions v4. Migrate $functionAppName before rerunning setup."
+    }
+
+    $runtime = az functionapp config show --name $functionAppName --resource-group $resourceGroupName --query linuxFxVersion --output tsv
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($runtime)) {
+        throw "Could not inspect linuxFxVersion for $functionAppName."
+    }
+    if ($runtime -ne $targetRuntime) {
+        if ($plan.sku.tier -eq "Dynamic") {
+            throw "Cannot upgrade $functionAppName from '$runtime' to '$targetRuntime': Azure Functions does not support changing Python versions on Linux Consumption apps. Provision a new Python 3.12 relay under a new -functionAppName, or migrate to a supported plan first; then update the D365 endpoint."
+        }
+        if ($runtime -notmatch '^Python\|') {
+            throw "Expected a managed Python stack, found '$runtime'; no runtime changes were made."
+        }
+        az functionapp config set --name $functionAppName --resource-group $resourceGroupName `
+            --linux-fx-version $targetRuntime | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "Could not configure $targetRuntime for $functionAppName." }
+    }
+
+    $verifiedRuntime = az functionapp config show --name $functionAppName --resource-group $resourceGroupName --query linuxFxVersion --output tsv
+    if ($LASTEXITCODE -ne 0 -or $verifiedRuntime -ne $targetRuntime) {
+        throw "Python 3.12 runtime verification failed for $functionAppName (reported '$verifiedRuntime')."
+    }
+    Write-Host "Verified $targetRuntime for $functionAppName."
 
     # Build requirements.txt remotely (Oryx) during zip deploy.
     az functionapp config appsettings set --name $functionAppName --resource-group $resourceGroupName `
         --settings "SCM_DO_BUILD_DURING_DEPLOYMENT=1" "ENABLE_ORYX_BUILD=true" | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "Could not configure the relay remote build settings." }
 }
 
 function Ensure-RoleAssignment([string]$assignee, [string]$role, [string]$scope) {

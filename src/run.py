@@ -7,7 +7,7 @@ mini-batch to the unchanged forecast.r via Rscript.
 import os
 import tempfile
 
-from azure.ai.ml import Input, Output
+from azure.ai.ml import Input, Output, command
 from azure.ai.ml.constants import AssetTypes, InputOutputModes
 from azure.ai.ml.entities import Environment, BuildContext
 from azure.ai.ml.parallel import parallel_run_function, RunFunction
@@ -81,6 +81,22 @@ def build_parallel_job(input_data, output_data=None, code_asset=None):
         # Local path fallback (newer SDKs / offline construction).
         code_value = "." + os.sep + os.path.relpath(_R_SOURCE_DIR, os.getcwd())
 
+    environment = r_environment()
+    # Like v1 partition_by, materialize complete histories before dispatch. Merely
+    # setting partition_keys on the original flat CSV does not prepare partitions.
+    prepare = command(
+        name="partition_history",
+        display_name="Partition complete forecast histories",
+        code=code_value,
+        environment=environment,
+        inputs={"input_data": Input(type=AssetTypes.MLTABLE, mode=InputOutputModes.RO_MOUNT)},
+        outputs={"partitioned_data": Output(type=AssetTypes.MLTABLE, mode=InputOutputModes.RW_MOUNT)},
+        command=(
+            'python partition_input.py --input_data "${{inputs.input_data}}" '
+            '--output_data "${{outputs.partitioned_data}}"'
+        ),
+    )(input_data=input_data)
+
     parallel_job = parallel_run_function(
         name="r_forecast",
         display_name="Generate demand forecast",
@@ -96,11 +112,7 @@ def build_parallel_job(input_data, output_data=None, code_asset=None):
             job_output_path=Output(type=AssetTypes.URI_FILE)
         ),
         input_data="${{inputs.job_data_path}}",
-        # Feed the whole (small) tabular input as a single mini-batch; entry.py
-        # groups it by GranularityAttributeKey and forecasts each key. (partition_keys
-        # did not group reliably here -- the harness produced 1 default partition
-        # "000000000" with 0 rows per task.)
-        mini_batch_size="500mb",
+        partition_keys=["GranularityAttributeKey"],
         instance_count=parameters.nodes_count,
         # Ignore item-level failures (output rows < input rows is expected here).
         error_threshold=-1,
@@ -112,7 +124,7 @@ def build_parallel_job(input_data, output_data=None, code_asset=None):
             code=code_value,
             # v2 needs a Python entry script; entry.py shims to forecast.r via Rscript.
             entry_script="entry.py",
-            environment=r_environment(),
+            environment=environment,
             # v1 output_action="append_row" -> v2 append_row_to: aggregate every
             # mini-batch return into one file (headerless, sequential), referencing
             # the job output declared above.
@@ -120,7 +132,7 @@ def build_parallel_job(input_data, output_data=None, code_asset=None):
         ),
     )
 
-    job = parallel_job(job_data_path=input_data)
+    job = parallel_job(job_data_path=prepare.outputs.partitioned_data)
     # Tabular MLTABLE is consumed in DIRECT mode so run() receives a DataFrame.
     job.inputs.job_data_path.mode = InputOutputModes.DIRECT
     if output_data is not None:
