@@ -85,9 +85,8 @@ def register_mltable_asset(ml_client: MLClient, csv_datastore_uri: str, read_int
     """Build an MLTABLE around the input CSV; return a registered asset id or, when
     register=False, the local MLTable folder path (used inline as a job input).
 
-    The parallel job requests dispatch by GranularityAttributeKey.
-    infer_column_types=False keeps sparse parameter columns as plain strings
-    (otherwise it mis-infers e.g. 0 -> 0.0/False).
+    The parallel pipeline prepares per-key MLTable partitions before dispatch.
+    infer_column_types=False keeps sparse parameter columns as strings.
 
     read_into_memory=True reads + rewrites one self-contained data.csv (robust for
     hand-edited inputs). Set it False for large inputs (e.g. from the relay) to make
@@ -160,7 +159,7 @@ def register_mltable_asset(ml_client: MLClient, csv_datastore_uri: str, read_int
                 version=version,
                 type=AssetTypes.MLTABLE,
                 path=mltable_dir,
-                description="MLTable for the demand forecast input (grouped by key in the entry script).",
+                description="Source MLTable for demand forecast history partitioning.",
             )
             registered = data_ops.create_or_update(data_asset)
             if getattr(registered, "id", None):
@@ -193,7 +192,7 @@ def get_ml_client() -> MLClient:
     default_compute=parameters.compute_cluster_name,
 )
 def demand_forecast_pipeline(input_data: Input):
-    """Pipeline wrapping the single R parallel job step."""
+    """Prepare per-key histories and run R forecasts in one pipeline job."""
     forecast_step = build_parallel_job(
         input_data=input_data, code_asset=_REGISTERED_CODE
     )
