@@ -385,10 +385,10 @@ function Ensure-FunctionApp {
         Write-Host "Function app $functionAppName already exists."
     }
     else {
-        Write-Host "Creating a Function app $functionAppName (Linux, Python 3.11, Consumption) ..."
+        Write-Host "Creating a Function app $functionAppName (Linux, Python 3.12, Consumption) ..."
         $res = az functionapp create --name $functionAppName --resource-group $resourceGroupName `
             --storage-account $functionStorageAccountName --consumption-plan-location $location `
-            --os-type Linux --runtime python --runtime-version 3.11 --functions-version 4
+            --os-type Linux --runtime python --runtime-version 3.12 --functions-version 4
         if ($LASTEXITCODE -ne 0) { throw $res }
     }
 

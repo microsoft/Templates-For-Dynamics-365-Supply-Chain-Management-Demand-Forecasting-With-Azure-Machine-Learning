@@ -7,7 +7,7 @@ mini-batch to the unchanged forecast.r via Rscript.
 import os
 import tempfile
 
-from azure.ai.ml import Input, Output
+from azure.ai.ml import Input, Output, command
 from azure.ai.ml.constants import AssetTypes, InputOutputModes
 from azure.ai.ml.entities import Environment, BuildContext
 from azure.ai.ml.parallel import parallel_run_function, RunFunction
@@ -41,7 +41,8 @@ def r_environment() -> Environment:
 
 # Same R packages as the v1 template, on a current AzureML CPU base image.
 _R_DOCKERFILE = r"""
-FROM mcr.microsoft.com/azureml/openmpi4.1.0-ubuntu20.04:latest
+# Current rslex wheels require a newer glibc than Ubuntu 20.04 provides.
+FROM mcr.microsoft.com/azureml/openmpi4.1.0-ubuntu22.04:latest
 
 # Pin pip to avoid a known ruamel installation issue.
 RUN conda install -c r -y pip=24.0
@@ -51,20 +52,22 @@ RUN conda install -c r -y pip=24.0
 # "ModuleNotFoundError: No module named 'mltable'" / PandasImportError.
 RUN pip install azureml-dataset-runtime mltable "azureml-dataprep[pandas]"
 
-# Setup R runtime. Ref: http://cran.rstudio.com/bin/linux/ubuntu/
-RUN apt update -qq -y \
-  && apt install --no-install-recommends software-properties-common dirmngr -y \
-  && apt-key adv --keyserver keyserver.ubuntu.com --recv-keys E298A3A825C0D65DFD57CBB651716619E084DAB9 \
-  && add-apt-repository "deb https://cloud.r-project.org/bin/linux/ubuntu $(lsb_release -cs)-cran40/" \
-  && add-apt-repository ppa:c2d4u.team/c2d4u4.0+ \
-  && apt-get update \
-  && apt install r-base r-base-dev littler curl r-cran-curl -y --allow-unauthenticated
+# Exercise native rslex and CSV materialization inside the image, not on the host.
+RUN python -c "import tempfile; from pathlib import Path; import mltable; import azureml.dataprep; import azureml.dataprep.rslex; tmp = tempfile.TemporaryDirectory(); path = Path(tmp.name) / 'smoke.csv'; path.write_text('key,value\n001,2\n'); frame = mltable.from_delimited_files([{'file': str(path)}], infer_column_types=False).to_pandas_dataframe(); assert frame.shape == (1, 2) and frame.iloc[0, 0] == '001'; tmp.cleanup()"
 
-# Install packages used by the R agent.
-RUN r -e 'install.packages(c("funr", "jsonlite", "logging"))'
-RUN r -e 'install.packages("forecast", repos = "http://cran.us.r-project.org")'
-RUN r -e 'install.packages("plyr", repos = "http://cran.us.r-project.org")'
-RUN r -e 'install.packages("zoo", repos = "http://cran.us.r-project.org")'
+# Signed CRAN repository for Ubuntu 22.04; the old c2d4u PPA is no longer maintained.
+RUN apt-get update -qq \
+  && apt-get install --no-install-recommends -y ca-certificates curl gnupg \
+  && curl -fsSL https://cloud.r-project.org/bin/linux/ubuntu/marutter_pubkey.asc -o /usr/share/keyrings/cran.asc \
+  && gpg --show-keys --with-colons /usr/share/keyrings/cran.asc | grep -q '^fpr:::::::::E298A3A825C0D65DFD57CBB651716619E084DAB9:' \
+  && echo "deb [signed-by=/usr/share/keyrings/cran.asc] https://cloud.r-project.org/bin/linux/ubuntu jammy-cran40/" > /etc/apt/sources.list.d/cran.list \
+  && apt-get update -qq \
+  && DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y \
+     r-base r-base-dev littler r-cran-curl libcurl4-openssl-dev libssl-dev libxml2-dev \
+  && rm -rf /var/lib/apt/lists/*
+
+# install.packages can warn rather than fail, so require every package afterwards.
+RUN Rscript -e 'packages <- c("funr", "jsonlite", "logging", "forecast", "plyr", "zoo"); install.packages(packages, repos = "https://cloud.r-project.org"); for (package in packages) library(package, character.only = TRUE)'
 """
 
 
@@ -81,6 +84,29 @@ def build_parallel_job(input_data, output_data=None, code_asset=None):
         # Local path fallback (newer SDKs / offline construction).
         code_value = "." + os.sep + os.path.relpath(_R_SOURCE_DIR, os.getcwd())
 
+    environment = r_environment()
+    prepare = command(
+        name="partition_history",
+        display_name="Partition forecast history",
+        code=code_value,
+        environment=environment,
+        inputs={
+            "input_data": Input(
+                type=AssetTypes.MLTABLE, mode=InputOutputModes.RO_MOUNT
+            )
+        },
+        outputs={
+            "partitioned_data": Output(
+                type=AssetTypes.MLTABLE, mode=InputOutputModes.RW_MOUNT
+            )
+        },
+        command=(
+            'python partition_input.py --input_data "${{inputs.input_data}}" '
+            '--output_data "${{outputs.partitioned_data}}"'
+        ),
+    )(input_data=input_data)
+    prepare.inputs.input_data.mode = InputOutputModes.RO_MOUNT
+
     parallel_job = parallel_run_function(
         name="r_forecast",
         display_name="Generate demand forecast",
@@ -96,11 +122,7 @@ def build_parallel_job(input_data, output_data=None, code_asset=None):
             job_output_path=Output(type=AssetTypes.URI_FILE)
         ),
         input_data="${{inputs.job_data_path}}",
-        # Feed the whole (small) tabular input as a single mini-batch; entry.py
-        # groups it by GranularityAttributeKey and forecasts each key. (partition_keys
-        # did not group reliably here -- the harness produced 1 default partition
-        # "000000000" with 0 rows per task.)
-        mini_batch_size="500mb",
+        partition_keys=["GranularityAttributeKey"],
         instance_count=parameters.nodes_count,
         # Ignore item-level failures (output rows < input rows is expected here).
         error_threshold=-1,
@@ -112,7 +134,7 @@ def build_parallel_job(input_data, output_data=None, code_asset=None):
             code=code_value,
             # v2 needs a Python entry script; entry.py shims to forecast.r via Rscript.
             entry_script="entry.py",
-            environment=r_environment(),
+            environment=environment,
             # v1 output_action="append_row" -> v2 append_row_to: aggregate every
             # mini-batch return into one file (headerless, sequential), referencing
             # the job output declared above.
@@ -120,7 +142,7 @@ def build_parallel_job(input_data, output_data=None, code_asset=None):
         ),
     )
 
-    job = parallel_job(job_data_path=input_data)
+    job = parallel_job(job_data_path=prepare.outputs.partitioned_data)
     # Tabular MLTABLE is consumed in DIRECT mode so run() receives a DataFrame.
     job.inputs.job_data_path.mode = InputOutputModes.DIRECT
     if output_data is not None:

@@ -20,6 +20,8 @@ Supply Chain Management's demand forecasting connector calls an Azure Machine Le
 - `relay/` – the Azure Function that bridges Supply Chain Management to the v2 pipeline.
 - `sampleInput.csv` – sample input used to validate the setup.
 
+New relay Function apps use Python 3.12; rerunning setup does not change an existing app's Python version. The pipeline prepares per-key history files and MLTable partition metadata before parallel dispatch; it materializes the input table in memory on AML compute. Validate cloud dispatch before production use; partitioning alone does not establish that `RequestBodyTooLarge` is resolved.
+
 ## Contributing
 
 This project welcomes contributions and suggestions.  Most contributions require you to agree to a
