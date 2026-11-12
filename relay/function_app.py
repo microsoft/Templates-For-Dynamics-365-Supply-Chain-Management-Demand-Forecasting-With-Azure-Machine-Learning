@@ -17,10 +17,13 @@ The forecast pipeline itself is unchanged -- this reuses api_trigger's builders.
 """
 import json
 import logging
+import math
 import os
 import re
 import sys
 import threading
+from urllib.parse import urlsplit
+from uuid import UUID
 
 import azure.functions as func
 
@@ -35,18 +38,22 @@ _DATASTORE = os.environ.get("RELAY_DATASTORE", "workspaceblobdemplan")
 _SUBSCRIPTION = os.environ.get("AML_SUBSCRIPTION_ID")
 _RESOURCE_GROUP = os.environ.get("AML_RESOURCE_GROUP")
 _WORKSPACE = os.environ.get("AML_WORKSPACE_NAME")
-# Optional caller validation: when both are set, the incoming AAD token must be
-# from this tenant and issued to this app (the D365 service principal).
+# Required caller pins and one operator-verified legacy resource audience.
 _EXPECTED_TENANT = os.environ.get("RELAY_EXPECTED_TENANT_ID")
 _EXPECTED_APP_ID = os.environ.get("RELAY_EXPECTED_APP_ID")
+_EXPECTED_AUDIENCE = os.environ.get("RELAY_EXPECTED_AUDIENCE")
 
 _ml_client = None
 _code_asset = None
 _lock = threading.Lock()
-_jwk_client = None
+_jwk_clients = {}
 
 
 class _Unauthorized(Exception):
+    pass
+
+
+class _AuthenticationUnavailable(Exception):
     pass
 
 
@@ -77,16 +84,63 @@ def _client():
     return _ml_client
 
 
-def _validate_token(req):
-    """Verify the caller's AAD bearer token (issuer tenant + app id). The token's
-    audience is AML, not this app, so audience is not checked. Fails closed: if the
-    expected tenant/app id are not configured, the request is rejected."""
-    if not (_EXPECTED_TENANT and _EXPECTED_APP_ID):
-        raise _Unauthorized(
-            "Caller validation is not configured. Set the RELAY_EXPECTED_TENANT_ID "
-            "and RELAY_EXPECTED_APP_ID app settings to the D365 service principal's "
-            "tenant id and application id."
+def _identity_guid(value):
+    if not isinstance(value, str) or not re.fullmatch(
+        r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", value
+    ):
+        raise ValueError("Invalid identity GUID.")
+    parsed = UUID(value)
+    if not parsed.int:
+        raise ValueError("Empty identity GUID.")
+    return str(parsed)
+
+
+def _audience_is_valid(value):
+    if not isinstance(value, str) or not value or re.search(
+        r"""[\s\x00-\x1f\x7f*<>{}\[\],;|@"'\\]""", value
+    ) or re.search(r"(^|/)\.default(/|$)", value, re.IGNORECASE):
+        return False
+    try:
+        _identity_guid(value)
+        return True
+    except ValueError:
+        pass
+    try:
+        uri = urlsplit(value)
+        uri.port  # Reject malformed or out-of-range ports.
+        return (
+            uri.scheme in ("https", "api")
+            and bool(uri.hostname)
+            and uri.username is None
+            and uri.password is None
+            and not uri.query
+            and not uri.fragment
+            and "?" not in value
+            and "#" not in value
         )
+    except ValueError:
+        return False
+
+
+def _validation_config():
+    try:
+        tenant = _identity_guid(_EXPECTED_TENANT)
+        caller = _identity_guid(_EXPECTED_APP_ID)
+        if not _audience_is_valid(_EXPECTED_AUDIENCE):
+            raise ValueError("Invalid resource audience.")
+    except ValueError:
+        logging.error(
+            "Configure RELAY_EXPECTED_TENANT_ID, RELAY_EXPECTED_APP_ID and "
+            "RELAY_EXPECTED_AUDIENCE with approved IDs and one exact resource "
+            "audience, not a scope or /.default value."
+        )
+        raise _AuthenticationUnavailable("Relay authentication is not configured correctly.") from None
+    return tenant, caller, _EXPECTED_AUDIENCE
+
+
+def _validate_token(req):
+    """Validate a pinned legacy audience using tenant-bound Entra v1/v2 profiles."""
+    tenant, caller, audience = _validation_config()
 
     auth = req.headers.get("Authorization", "")
     if not auth.lower().startswith("bearer "):
@@ -96,24 +150,65 @@ def _validate_token(req):
     import jwt
     from jwt import PyJWKClient
 
-    global _jwk_client
-    if _jwk_client is None:
-        _jwk_client = PyJWKClient(
-            f"https://login.microsoftonline.com/{_EXPECTED_TENANT}/discovery/v2.0/keys"
-        )
     try:
-        signing_key = _jwk_client.get_signing_key_from_jwt(token).key
-        claims = jwt.decode(
-            token, signing_key, algorithms=["RS256"], options={"verify_aud": False}
-        )
-    except Exception as exc:  # noqa: BLE001
-        raise _Unauthorized(f"Invalid token: {exc}")
+        header = jwt.get_unverified_header(token)
+        if header.get("alg") != "RS256" or not isinstance(header.get("kid"), str) or not header["kid"].strip():
+            raise _Unauthorized("Invalid bearer token.")
+        # Unverified `ver` selects only these finite, configured-tenant profiles.
+        # No token issuer, jku or x5u URL is ever used for discovery.
+        version = jwt.decode(token, options={"verify_signature": False}).get("ver")
+        if version == "1.0":
+            issuer = f"https://sts.windows.net/{tenant}/"
+            keys_url = f"https://login.microsoftonline.com/{tenant}/discovery/keys"
+            caller_claim, other_caller_claim = "appid", "azp"
+        elif version == "2.0":
+            issuer = f"https://login.microsoftonline.com/{tenant}/v2.0"
+            keys_url = f"https://login.microsoftonline.com/{tenant}/discovery/v2.0/keys"
+            caller_claim, other_caller_claim = "azp", "appid"
+        else:
+            raise _Unauthorized("Invalid bearer token.")
 
-    if _EXPECTED_TENANT not in claims.get("iss", ""):
-        raise _Unauthorized("Token from unexpected tenant.")
-    caller_app = claims.get("appid") or claims.get("azp")
-    if caller_app != _EXPECTED_APP_ID:
-        raise _Unauthorized("Token issued to unexpected application.")
+        with _lock:
+            if keys_url not in _jwk_clients:
+                _jwk_clients[keys_url] = PyJWKClient(keys_url)
+            jwk_client = _jwk_clients[keys_url]
+        signing_key = jwk_client.get_signing_key(header["kid"]).key
+        claims = jwt.decode(
+            token,
+            signing_key,
+            algorithms=["RS256"],
+            audience=audience,
+            issuer=issuer,
+            options={
+                "require": ["exp", "iss", "aud", "tid", "ver", caller_claim],
+                "strict_aud": True,
+            },
+        )
+        if (
+            claims["ver"] != version
+            or not isinstance(claims["iss"], str)
+            or claims["iss"] != issuer
+            or claims["aud"] != audience
+            or not isinstance(claims["aud"], str)
+            or _identity_guid(claims["tid"]) != tenant
+            or _identity_guid(claims[caller_claim]) != caller
+            or (
+                other_caller_claim in claims
+                and _identity_guid(claims[other_caller_claim]) != caller
+            )
+        ):
+            raise _Unauthorized("Invalid bearer token.")
+        for name in ("exp", "nbf", "iat"):
+            if name in claims and (
+                type(claims[name]) not in (int, float)
+                or (isinstance(claims[name], float) and not math.isfinite(claims[name]))
+            ):
+                raise _Unauthorized("Invalid bearer token.")
+    except jwt.PyJWKClientConnectionError:
+        logging.warning("Unable to retrieve trusted Entra signing keys.")
+        raise _AuthenticationUnavailable("Token signing keys are temporarily unavailable.") from None
+    except (jwt.PyJWTError, ValueError, TypeError, OverflowError, RecursionError):
+        raise _Unauthorized("Invalid bearer token.") from None
 
 
 def _map_status(aml_status):
@@ -216,6 +311,8 @@ def pipelines(req: func.HttpRequest) -> func.HttpResponse:
         _validate_token(req)
     except _Unauthorized as exc:
         return _json({"error": str(exc)}, 401)
+    except _AuthenticationUnavailable as exc:
+        return _json({"error": str(exc)}, 503)
 
     path = req.route_params.get("path", "")
     try:
@@ -235,6 +332,8 @@ def history(req: func.HttpRequest) -> func.HttpResponse:
         _validate_token(req)
     except _Unauthorized as exc:
         return _json({"error": str(exc)}, 401)
+    except _AuthenticationUnavailable as exc:
+        return _json({"error": str(exc)}, 503)
 
     path = req.route_params.get("path", "")
     try:
