@@ -36,9 +36,16 @@ param (
     [string]
     $workspaceName,
 
-    [Parameter(Mandatory, ParameterSetName = 'Full')]
+    # A display name is a creation label, never an identity to reuse.
+    [Parameter(ParameterSetName = 'Full')]
+    [ValidateNotNullOrEmpty()]
     [string]
     $AADApplicationName,
+
+    [Parameter(ParameterSetName = 'Full')]
+    [ValidateNotNullOrEmpty()]
+    [string]
+    $AADApplicationId = "",
 
     # Relay (Azure Function) that bridges D365's v1 pipeline-endpoint contract to v2.
     [Parameter(Mandatory)]
@@ -49,12 +56,19 @@ param (
     [string]
     $functionStorageAccountName,
 
-    # When set, the relay validates the D365 caller's token (tenant + app id).
+    # Optional overrides for the relay's pinned D365 caller (tenant + client ID).
+    [ValidateNotNullOrEmpty()]
     [string]
     $d365TenantId = "",
 
+    [ValidateNotNullOrEmpty()]
     [string]
     $d365AppId = "",
+
+    # Optional exact audience override; otherwise discover using a secure secret prompt.
+    [ValidateNotNullOrEmpty()]
+    [string]
+    $d365TokenAudience = "",
 
     # Re-deploy only the relay (idempotent); skips the AML workspace setup.
     [Parameter(ParameterSetName = 'RelayOnly')]
@@ -65,17 +79,320 @@ param (
 $storageContainer = "demplan-azureml"  #should not be changed
 $computeCluster_Name = "e2ecpucluster" #should not be changed
 $workspaceBlobDS = "workspaceblobdemplan"
+$script:azureTenantId = $null
+$script:applicationClientId = $null
+$script:applicationObjectId = $null
+$script:applicationCreated = $false
+$script:servicePrincipalObjectId = $null
+$script:relayExpectedTenantId = $null
+$script:relayExpectedAppId = $null
+$script:relayExpectedAudience = $null
 
-function Set-SubscriptionContext{
-    # check the subscription
-    $res = az account list --query "[?id=='$subscriptionId'].id" --output tsv
-    if ([string]::IsNullOrEmpty($res)) {
-        Write-Warning "Subscription $subscriptionId is not valid for the current account."
-        throw
+function ConvertTo-IdentityGuid([string]$value, [string]$label) {
+    $parsed = [guid]::Empty
+    if (-not [guid]::TryParseExact($value, "D", [ref]$parsed) -or $parsed -eq [guid]::Empty) {
+        throw "$label must be a non-empty GUID in xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx format."
     }
+    return $parsed.ToString()
+}
 
-    # set current subscription context
+function Assert-TokenAudience([string]$value) {
+    $guidAudience = [guid]::Empty
+    $uriAudience = $null
+    $isGuid = [guid]::TryParseExact($value, "D", [ref]$guidAudience) -and $guidAudience -ne [guid]::Empty
+    $isUri = [uri]::TryCreate($value, [UriKind]::Absolute, [ref]$uriAudience) -and
+        $uriAudience.Scheme -in @("https", "api") -and $uriAudience.Host -and
+        -not $uriAudience.UserInfo -and -not $uriAudience.Query -and -not $uriAudience.Fragment
+    if ([string]::IsNullOrWhiteSpace($value) -or $value -match '\s|[\x00-\x1f\x7f*<>{}\[\],;|@"''\\?#]' -or
+        $value -match '(^|/)\.default(/|$)' -or -not ($isGuid -or $isUri)) {
+        throw "Specify -d365TokenAudience as one exact operator-verified legacy token aud (resource URI or resource GUID), not a scope, /.default value, caller client ID, or guessed Function URL."
+    }
+}
+
+function Assert-SetupInteractive([string]$guidance) {
+    $nonInteractive = @([Environment]::GetCommandLineArgs() | Where-Object { $_ -like "-noni*" }).Count -gt 0
+    if (-not [Environment]::UserInteractive -or $nonInteractive -or
+        ($Host.Name -eq "ConsoleHost" -and [Console]::IsInputRedirected)) {
+        throw $guidance
+    }
+}
+
+function Assert-AudienceDiscoveryInteractive {
+    Assert-SetupInteractive "Audience discovery requires an interactive secure prompt. Supply a verified -d365TokenAudience when running unattended or with redirected input."
+}
+
+function Read-SetupValue([string]$prompt, [string]$parameterGuidance) {
+    Assert-SetupInteractive "Setup requires interactive input. $parameterGuidance when running unattended or with redirected input."
+    try {
+        $value = Read-Host $prompt -ErrorAction Stop
+    }
+    catch {
+        throw "Setup input was canceled or unavailable. $parameterGuidance to run without this prompt."
+    }
+    if ($value -isnot [string] -or [string]::IsNullOrWhiteSpace($value)) {
+        throw "Setup input cannot be empty. $parameterGuidance to provide it explicitly."
+    }
+    return $value
+}
+
+function Read-SetupIdentityInputs {
+    if ($RelayOnly) {
+        if (-not $d365AppId) {
+            $script:d365AppId = Read-SetupValue "D365 application client ID (GUID, not an object ID)" "Supply -d365AppId"
+        }
+    }
+    elseif (-not $AADApplicationId -and -not $AADApplicationName) {
+        Write-Host "Forecast application:"
+        Write-Host "1. Create a new Entra application"
+        Write-Host "2. Use an existing Entra application (client ID)"
+        $choice = Read-SetupValue "Select 1 or 2" "Supply -AADApplicationName or -AADApplicationId"
+        switch ($choice.Trim()) {
+            "1" {
+                $script:AADApplicationName = Read-SetupValue "New forecast application display name" "Supply -AADApplicationName"
+            }
+            "2" {
+                $script:AADApplicationId = Read-SetupValue "Approved forecast application client ID (GUID, not a display name or object ID)" "Supply -AADApplicationId"
+            }
+            default {
+                throw "Select 1 or 2. No application was selected. Alternatively, supply -AADApplicationName or -AADApplicationId."
+            }
+        }
+    }
+}
+
+function ConvertFrom-TokenSegment([string]$segment) {
+    $bytes = $parseOptions = $result = $null
+    try {
+        $segment = $segment.Replace("-", "+").Replace("_", "/")
+        switch ($segment.Length % 4) {
+            0 { }
+            2 { $segment += "==" }
+            3 { $segment += "=" }
+            default { throw "Invalid JWT segment encoding." }
+        }
+        $bytes = [Convert]::FromBase64String($segment)
+        $parseOptions = @{
+            InputObject = ([Text.UTF8Encoding]::new($false, $true)).GetString($bytes)
+            ErrorAction = "Stop"
+        }
+        if ((Get-Command ConvertFrom-Json).Parameters.ContainsKey("NoEnumerate")) {
+            $parseOptions.NoEnumerate = $true
+        }
+        $result = ConvertFrom-Json @parseOptions
+        if ($result -is [array] -or $result -isnot [pscustomobject]) { throw "A JWT segment must contain a JSON object." }
+        return $result
+    }
+    finally {
+        if ($bytes) { [Array]::Clear($bytes, 0, $bytes.Length) }
+        Remove-Variable segment, bytes, parseOptions, result -ErrorAction SilentlyContinue
+    }
+}
+
+function Get-D365TokenAudience([string]$tenantId, [string]$clientId) {
+    $tenantId = ConvertTo-IdentityGuid $tenantId "D365 caller tenant ID"
+    $clientId = ConvertTo-IdentityGuid $clientId "D365 caller application client ID"
+    Assert-AudienceDiscoveryInteractive
+    Write-Host "Discovering the token audience for D365 caller $clientId in tenant $tenantId."
+    if ($script:applicationCreated -and $clientId -eq $script:applicationClientId -and $tenantId -eq $script:azureTenantId) {
+        Write-Host "Create the client secret in Azure portal while this script waits:"
+        Write-Host "1. Open https://portal.azure.com. In Settings > Directories + subscriptions, switch to tenant $tenantId."
+        Write-Host "2. Use the top search to open App registrations > All applications. Search for application (client) ID $clientId and select the matching app."
+        Write-Host "3. Open Certificates & secrets > Client secrets > New client secret."
+        Write-Host "4. Enter a description and choose an expiry according to your organization's policy, then select Add."
+        Write-Host "5. Copy the secret VALUE (not Secret ID), retain it securely for D365, and enter it at the secure prompt below. Setup will then continue."
+    }
+    else {
+        Write-Host "Use the active client secret for this D365 application. Previously created secret Values cannot be retrieved from Entra; coordinate with the D365 administrator if needed."
+    }
+    Write-Host "The secret and token are used only in memory and are not printed or saved. Do not enable HTTP tracing or request logging."
+
+    $secret = $credential = $body = $response = $parts = $header = $claims = $null
+    $stage = "prompt"
+    try {
+        $secret = Read-Host "D365 application client secret" -AsSecureString
+        if ($secret -isnot [Security.SecureString] -or $secret.Length -eq 0) {
+            throw "A client secret is required."
+        }
+        $stage = "request"
+        $credential = [Net.NetworkCredential]::new("", $secret)
+        $body = @{
+            client_id = $clientId
+            client_secret = $credential.Password
+            scope = "https://management.azure.com/.default"
+            grant_type = "client_credentials"
+        }
+        $response = Invoke-RestMethod -Method Post `
+            -Uri "https://login.microsoftonline.com/$tenantId/oauth2/v2.0/token" `
+            -ContentType "application/x-www-form-urlencoded" -Body $body `
+            -TimeoutSec 30 -MaximumRedirection 0 -ErrorAction Stop -Verbose:$false -Debug:$false
+        $body.Clear()
+        $credential.Password = ""
+        $secret.Dispose()
+        $secret = $null
+
+        # Inspect only the direct Entra HTTPS response; the relay still verifies signatures.
+        $stage = "response"
+        if ($response -is [array] -or $response -isnot [pscustomobject] -or $response.token_type -isnot [string] -or
+            $response.token_type -ne "Bearer" -or $response.access_token -isnot [string] -or
+            $response.access_token -cnotmatch '^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$') {
+            throw "The token endpoint did not return a bearer JWT."
+        }
+        $parts = $response.access_token.Split(".")
+        $header = ConvertFrom-TokenSegment $parts[0]
+        $claims = ConvertFrom-TokenSegment $parts[1]
+        if ($header.alg -isnot [string] -or $header.alg -cne "RS256" -or
+            $header.kid -isnot [string] -or [string]::IsNullOrWhiteSpace($header.kid)) {
+            throw "The token does not use a supported signing profile."
+        }
+        if ($claims.ver -isnot [string]) { throw "The token version must be a string." }
+        if ($claims.ver -ceq "1.0") {
+            $issuer = "https://sts.windows.net/$tenantId/"
+            $callerClaim = "appid"
+            $otherCallerClaim = "azp"
+        }
+        elseif ($claims.ver -ceq "2.0") {
+            $issuer = "https://login.microsoftonline.com/$tenantId/v2.0"
+            $callerClaim = "azp"
+            $otherCallerClaim = "appid"
+        }
+        else { throw "The token has an unsupported version." }
+        if ($claims.iss -isnot [string] -or $claims.iss -cne $issuer -or
+            $claims.tid -isnot [string] -or $claims.$callerClaim -isnot [string] -or
+            (ConvertTo-IdentityGuid $claims.tid "Token tenant ID") -ne $tenantId -or
+            (ConvertTo-IdentityGuid $claims.$callerClaim "Token caller client ID") -ne $clientId) {
+            throw "The token does not identify the expected tenant and application."
+        }
+        if ($claims.PSObject.Properties[$otherCallerClaim] -and
+            ($claims.$otherCallerClaim -isnot [string] -or
+                (ConvertTo-IdentityGuid $claims.$otherCallerClaim "Additional token caller ID") -ne $clientId)) {
+            throw "The token has contradictory caller claims."
+        }
+        $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+        if ($null -eq $claims.PSObject.Properties["exp"]) { throw "The token has no expiration." }
+        foreach ($name in @("exp", "nbf", "iat")) {
+            if ($claims.PSObject.Properties[$name]) {
+                $date = $claims.$name
+                if (-not ($date -is [int] -or $date -is [long] -or $date -is [double] -or $date -is [decimal]) -or
+                    [double]::IsNaN([double]$date) -or [double]::IsInfinity([double]$date) -or
+                    ($name -eq "exp" -and $date -le $now) -or ($name -ne "exp" -and $date -gt $now)) {
+                    throw "The token has invalid lifetime claims."
+                }
+            }
+        }
+        if ($claims.aud -isnot [string]) { throw "The token must contain one string audience." }
+        Assert-TokenAudience $claims.aud
+        return $claims.aud
+    }
+    catch {
+        if ($stage -eq "prompt") {
+            throw "Audience discovery needs the D365 application's client secret. Enter it at the secure prompt, or supply a verified -d365TokenAudience to skip discovery."
+        }
+        if ($stage -eq "request") {
+            throw "Could not request the D365 application token. Check its tenant, active secret, directory propagation and HTTPS access to Microsoft Entra, or supply a verified -d365TokenAudience. No token response is displayed."
+        }
+        throw "Could not determine an audience from the token response: a supported, current bearer JWT for the selected tenant/application with one resource audience is required. Check the application configuration and system clock, or supply a verified -d365TokenAudience."
+    }
+    finally {
+        if ($body) { $body.Clear() }
+        if ($response -isnot [array] -and $response -is [pscustomobject] -and
+            $response.PSObject.Properties["access_token"]) { $response.access_token = $null }
+        if ($credential) { $credential.Password = "" }
+        if ($secret -is [Security.SecureString]) { $secret.Dispose() }
+        if ($parts) { [Array]::Clear($parts, 0, $parts.Length) }
+        Remove-Variable secret, credential, body, response, parts, header, claims -ErrorAction SilentlyContinue
+    }
+}
+
+function Invoke-IdentityAzJson([string[]]$arguments) {
+    $json = az @arguments --only-show-errors --output json
+    if ($LASTEXITCODE -ne 0) {
+        throw "Azure CLI failed during identity setup: $($arguments[0]) $($arguments[1])."
+    }
+    if ([string]::IsNullOrWhiteSpace(($json -join "`n"))) {
+        throw "Azure CLI returned no JSON during identity setup: $($arguments[0]) $($arguments[1])."
+    }
+    try {
+        $parseOptions = @{ InputObject = ($json -join "`n"); ErrorAction = "Stop" }
+        # PowerShell 7 otherwise unwraps singleton arrays and drops empty arrays.
+        if ((Get-Command ConvertFrom-Json).Parameters.ContainsKey("NoEnumerate")) {
+            $parseOptions.NoEnumerate = $true
+        }
+        $result = ConvertFrom-Json @parseOptions
+    }
+    catch {
+        throw "Azure CLI returned invalid JSON during identity setup: $($arguments[0]) $($arguments[1])."
+    }
+    if ($null -eq $result) {
+        throw "Azure CLI returned null during identity setup: $($arguments[0]) $($arguments[1])."
+    }
+    return ,$result
+}
+
+function Check-IdentityInputs {
+    $script:subscriptionId = ConvertTo-IdentityGuid $subscriptionId "Subscription ID"
+    if ($AADApplicationId) {
+        $script:AADApplicationId = ConvertTo-IdentityGuid $AADApplicationId "Forecast application client ID"
+    }
+    if ($d365AppId) {
+        $script:d365AppId = ConvertTo-IdentityGuid $d365AppId "D365 caller application client ID"
+    }
+    if ($d365TenantId) {
+        $script:d365TenantId = ConvertTo-IdentityGuid $d365TenantId "D365 caller tenant ID"
+    }
+    if ($RelayOnly) {
+        if (-not $d365AppId) {
+            throw "Relay-only setup requires an operator-approved -d365AppId (application client ID); display names are not accepted."
+        }
+    }
+    elseif (-not $AADApplicationId -and [string]::IsNullOrWhiteSpace($AADApplicationName)) {
+        throw "Specify -AADApplicationId to reuse an operator-approved forecast application, or -AADApplicationName to create a new application."
+    }
+    if ($d365TokenAudience) { Assert-TokenAudience $d365TokenAudience }
+    else { Assert-AudienceDiscoveryInteractive }
+}
+
+function Assert-SubscriptionContext {
+    $account = Invoke-IdentityAzJson @("account", "show")
+    if ($account -is [array] -or $account -isnot [pscustomobject]) { throw "Azure CLI returned an invalid subscription context." }
+    $actualSubscription = ConvertTo-IdentityGuid $account.id "Active subscription ID"
+    $actualTenant = ConvertTo-IdentityGuid $account.tenantId "Active subscription tenant ID"
+    if ($actualSubscription -ne $subscriptionId) {
+        throw "The active subscription does not match -subscriptionId."
+    }
+    if ($script:azureTenantId -and $actualTenant -ne $script:azureTenantId) {
+        throw "The active directory tenant changed during setup."
+    }
+    $script:azureTenantId = $actualTenant
+}
+
+function Set-SubscriptionContext {
     az account set --subscription $subscriptionId
+    if ($LASTEXITCODE -ne 0) { throw "Could not select the requested Azure subscription." }
+    Assert-SubscriptionContext
+}
+
+function Resolve-RelayCaller {
+    $tenant = if ($d365TenantId) { $d365TenantId } else { $script:azureTenantId }
+    $caller = if ($d365AppId) { $d365AppId } elseif (-not $RelayOnly) { $script:applicationClientId }
+    $script:relayExpectedTenantId = ConvertTo-IdentityGuid $tenant "Relay caller tenant ID"
+    $script:relayExpectedAppId = ConvertTo-IdentityGuid $caller "Relay caller application client ID"
+    $script:relayExpectedAudience = $null
+    if ($d365TokenAudience) {
+        Assert-TokenAudience $d365TokenAudience
+        $script:relayExpectedAudience = $d365TokenAudience
+    }
+    else {
+        $script:relayExpectedAudience = Get-D365TokenAudience $script:relayExpectedTenantId $script:relayExpectedAppId
+    }
+    Assert-RelayCaller
+    Write-Host "D365 caller tenant: $script:relayExpectedTenantId; application client ID: $script:relayExpectedAppId"
+    Write-Host "Token audience: $script:relayExpectedAudience"
+}
+
+function Assert-RelayCaller {
+    Assert-TokenAudience $script:relayExpectedAudience
+    $script:relayExpectedTenantId = ConvertTo-IdentityGuid $script:relayExpectedTenantId "Relay caller tenant ID"
+    $script:relayExpectedAppId = ConvertTo-IdentityGuid $script:relayExpectedAppId "Relay caller application client ID"
 }
 
 function Check-InputParams {
@@ -275,56 +592,76 @@ function Create-ComputeCluster() {
     }
 }
 
-function Create-RoleForScope([string]$assignee, [string] $role, [string] $scope) {
-    $res = az role assignment create --assignee $assignee --role $role --scope $scope
-
-    if ($LASTEXITCODE -ne 0) {
-        # failed assign a role
-        Write-Warning "Error while trying to set up a role $role for $scope."
-        throw $res
+function Create-RoleForScope([string]$principalObjectId, [string]$role, [string]$scope) {
+    $assignment = Invoke-IdentityAzJson @("role", "assignment", "create",
+        "--assignee-object-id", $principalObjectId, "--assignee-principal-type", "ServicePrincipal",
+        "--role", $role, "--scope", $scope, "--subscription", $subscriptionId)
+    if ($assignment -is [array] -or $assignment -isnot [pscustomobject]) { throw "Azure CLI returned an invalid role assignment." }
+    if ((ConvertTo-IdentityGuid $assignment.principalId "Assigned principal object ID") -ne $principalObjectId -or
+        $assignment.principalType -ne "ServicePrincipal" -or $assignment.scope -ne $scope) {
+        throw "Azure CLI returned an unexpected role assignment principal or scope."
     }
 }
 
-function Create-AppWithPrincipal{
-    # create the AAD application (only if missing)
-    $existingAppId = az ad app list --display-name $AADApplicationName --query "[0].appId" --output tsv
-    if ($existingAppId) {
-        Write-Host "AAD application $AADApplicationName already exists."
-        $script:appId = $existingAppId
+function Create-AppWithPrincipal {
+    $script:applicationCreated = $false
+    if ($AADApplicationId) {
+        $application = Invoke-IdentityAzJson @("ad", "app", "show", "--id", $AADApplicationId,
+            "--query", "{appId:appId,id:id}")
+        if ($application -is [array] -or $application -isnot [pscustomobject]) { throw "Azure CLI returned an invalid application." }
+        $resolvedClientId = ConvertTo-IdentityGuid $application.appId "Resolved application client ID"
+        # `az ad app show --id` also accepts an application object ID.
+        if ($resolvedClientId -ne $AADApplicationId) {
+            throw "-AADApplicationId must be the intended application client ID, not an application object ID."
+        }
     }
     else {
+        $candidates = Invoke-IdentityAzJson @("ad", "app", "list", "--display-name", $AADApplicationName,
+            "--all", "--query", "[].{appId:appId,id:id}")
+        if ($candidates -isnot [array]) {
+            throw "Azure CLI returned an invalid application list."
+        }
+        if ($candidates.Count -ne 0) {
+            throw "Applications already match '$AADApplicationName'. Verify the intended application with your administrator and rerun with its client ID in -AADApplicationId. No application was selected by name."
+        }
         Write-Host "Creating an AAD application for forecast access ..."
-        $responseObj = az ad app create --display-name $AADApplicationName | ConvertFrom-Json
-
-        if ($LASTEXITCODE -ne 0) {
-            # failed creating AAD application
-            Write-Warning "Error while trying to create an AAD application."
-            throw $responseObj
-        }
-
-        $script:appId = $responseObj.appId
+        $application = Invoke-IdentityAzJson @("ad", "app", "create", "--display-name", $AADApplicationName,
+            "--query", "{appId:appId,id:id}")
+        if ($application -is [array] -or $application -isnot [pscustomobject]) { throw "Azure CLI returned an invalid created application." }
+        $resolvedClientId = ConvertTo-IdentityGuid $application.appId "Created application client ID"
+        $script:applicationCreated = $true
     }
 
-    # ensure a service principal exists for the app (only if missing)
-    $existingSp = az ad sp list --filter "appId eq '$appId'" --query "[0].id" --output tsv
-    if ($existingSp) {
-        Write-Host "Service principal for $AADApplicationName already exists."
+    $script:applicationClientId = $resolvedClientId
+    Write-Host "Forecast application client ID: $applicationClientId. For reruns, use -AADApplicationId $applicationClientId."
+    $script:applicationObjectId = ConvertTo-IdentityGuid $application.id "Application object ID"
+
+    $principals = Invoke-IdentityAzJson @("ad", "sp", "list", "--filter", "appId eq '$applicationClientId'",
+        "--all", "--query", "[].{id:id,appId:appId,appOwnerOrganizationId:appOwnerOrganizationId,servicePrincipalType:servicePrincipalType}")
+    if ($principals -isnot [array] -or $principals.Count -gt 1) {
+        throw "Azure CLI did not return a unique service principal for the pinned application."
+    }
+    if ($principals.Count -eq 1) {
+        $principal = $principals[0]
     }
     else {
-        Write-Host "Creating a service principal for an application $AADApplicationName ..."
-        $res = az ad sp create --id $appId
-
-        if ($LASTEXITCODE -ne 0) {
-            # failed creating service principal
-            Write-Warning "Error while trying to create a service principal."
-            throw $res
-        }
+        $principal = Invoke-IdentityAzJson @("ad", "sp", "create", "--id", $applicationClientId)
     }
+    if ($principal -is [array] -or $principal -isnot [pscustomobject]) { throw "Azure CLI returned an invalid service principal." }
+    $principalClientId = ConvertTo-IdentityGuid $principal.appId "Service principal application client ID"
+    $ownerTenantId = ConvertTo-IdentityGuid $principal.appOwnerOrganizationId "Application owner tenant ID"
+    if ($principalClientId -ne $applicationClientId -or $ownerTenantId -ne $script:azureTenantId -or
+        $principal.servicePrincipalType -ne "Application") {
+        throw "The service principal does not map to the pinned application in the selected subscription's tenant."
+    }
+    $script:servicePrincipalObjectId = ConvertTo-IdentityGuid $principal.id "Service principal object ID"
+}
 
-    # create security roles (idempotent)
-    Ensure-RoleAssignment $appId "Contributor" $workspaceId
-    Ensure-RoleAssignment $appId "Contributor" $storageAccountId
-    Ensure-RoleAssignment $appId "Storage Blob Data Contributor" $storageAccountId
+function Grant-ForecastAppRoles {
+    Assert-SubscriptionContext
+    Ensure-RoleAssignment $script:servicePrincipalObjectId "Contributor" $workspaceId
+    Ensure-RoleAssignment $script:servicePrincipalObjectId "Contributor" $storageAccountId
+    Ensure-RoleAssignment $script:servicePrincipalObjectId "Storage Blob Data Contributor" $storageAccountId
 }
 
 function Get-RelayEndpoint {
@@ -335,17 +672,16 @@ function Get-RelayEndpoint {
 }
 
 function Display-ScriptResult{
-    $azureTenantId = az account show --query "tenantId" --output tsv
     $documentationLink = "https://go.microsoft.com/fwlink/?linkid=2165514"
 
     Write-Host "`nDemand forecast setup script has completed."
-    Write-Host "Please create an application secret explicitly and proceed with workspace pipeline configuration according to public documentation: $documentationLink"
+    Write-Host "Use the D365 application's client secret (the one supplied during audience discovery, if used) for the Demand forecasting parameters. Follow: $documentationLink"
     
     # display information needed by FinOps for AML demand forecast
     Write-Host "`nDemand forecast parameters (enter these on the D365 Demand forecasting parameters page).`n"
-    Write-Host "Azure tenant id: $azureTenantId"
+    Write-Host "Azure tenant id: $script:relayExpectedTenantId"
     Write-Host "Storage account name: $storageAccountName"
-    Write-Host "Application id: $appId"
+    Write-Host "Application id: $script:relayExpectedAppId"
     Write-Host "Pipeline endpoint address (MLSPipelineEndpointUri): $(Get-RelayEndpoint)"
 }
 
@@ -397,51 +733,57 @@ function Ensure-FunctionApp {
         --settings "SCM_DO_BUILD_DURING_DEPLOYMENT=1" "ENABLE_ORYX_BUILD=true" | Out-Null
 }
 
-function Ensure-RoleAssignment([string]$assignee, [string]$role, [string]$scope) {
-    $existing = az role assignment list --assignee $assignee --role $role --scope $scope --query "[0].id" --output tsv 2>$null
-    if ($existing) {
-        Write-Host "Role '$role' already assigned for the scope."
-        return
+function Ensure-RoleAssignment([string]$principalObjectId, [string]$role, [string]$scope) {
+    $principalObjectId = ConvertTo-IdentityGuid $principalObjectId "Role assignee service principal object ID"
+    if ([string]::IsNullOrWhiteSpace($scope)) { throw "A role assignment requires an explicit resource scope." }
+    $assignments = Invoke-IdentityAzJson @("role", "assignment", "list", "--assignee-object-id", $principalObjectId,
+        "--scope", $scope, "--fill-principal-name", "false", "--subscription", $subscriptionId,
+        "--query", "[].{principalId:principalId,roleDefinitionName:roleDefinitionName,scope:scope}")
+    if ($assignments -isnot [array]) { throw "Azure CLI returned an invalid role assignment list." }
+    foreach ($assignment in $assignments) {
+        if ($assignment -is [array] -or $assignment -isnot [pscustomobject]) { throw "Azure CLI returned an invalid role assignment entry." }
+        $assignedPrincipal = ConvertTo-IdentityGuid $assignment.principalId "Existing role assignee object ID"
+        if ([string]::IsNullOrWhiteSpace($assignment.scope) -or [string]::IsNullOrWhiteSpace($assignment.roleDefinitionName)) {
+            throw "Azure CLI returned an incomplete role assignment."
+        }
+        if ($assignedPrincipal -eq $principalObjectId -and $assignment.roleDefinitionName -eq $role -and $assignment.scope -eq $scope) {
+            Write-Host "Role '$role' already assigned to the verified principal for the exact scope."
+            return
+        }
     }
-    Create-RoleForScope $assignee $role $scope
+    Create-RoleForScope $principalObjectId $role $scope
 }
 
 function Ensure-FunctionIdentityAndRoles {
+    Assert-SubscriptionContext
     Write-Host "Assigning the Function a managed identity and roles ..."
-    $principalId = az functionapp identity assign --name $functionAppName --resource-group $resourceGroupName --query principalId --output tsv
-    if ([string]::IsNullOrEmpty($principalId)) { throw "Could not assign a managed identity to the Function app." }
+    $identity = Invoke-IdentityAzJson @("functionapp", "identity", "assign", "--name", $functionAppName, "--resource-group", $resourceGroupName)
+    if ($identity -is [array] -or $identity -isnot [pscustomobject]) { throw "Azure CLI returned an invalid Function managed identity." }
+    $principalId = ConvertTo-IdentityGuid $identity.principalId "Function managed identity principal ID"
 
     $wsId = az ml workspace show --name $workspaceName --resource-group $resourceGroupName --query id --output tsv
+    if ($LASTEXITCODE -ne 0) { throw "Could not resolve the Function's workspace role scope." }
     $stId = az storage account show --name $storageAccountName --resource-group $resourceGroupName --query id --output tsv
+    if ($LASTEXITCODE -ne 0) { throw "Could not resolve the Function's storage role scope." }
 
     Ensure-RoleAssignment $principalId "Contributor" $wsId
     Ensure-RoleAssignment $principalId "Storage Blob Data Contributor" $stId
 }
 
 function Set-RelayAppSettings {
+    Assert-RelayCaller
     $settings = @(
         "AML_SUBSCRIPTION_ID=$subscriptionId",
         "AML_RESOURCE_GROUP=$resourceGroupName",
         "AML_WORKSPACE_NAME=$workspaceName",
-        "RELAY_DATASTORE=$workspaceBlobDS"
+        "RELAY_DATASTORE=$workspaceBlobDS",
+        "RELAY_EXPECTED_TENANT_ID=$script:relayExpectedTenantId",
+        "RELAY_EXPECTED_APP_ID=$script:relayExpectedAppId",
+        "RELAY_EXPECTED_AUDIENCE=$script:relayExpectedAudience"
     )
 
-    # The relay is fail-closed: it rejects callers unless the expected tenant + app
-    # id are set. Default them to the service principal this script provisions (the
-    # same Application id printed for the D365 Demand forecasting parameters page);
-    # -d365TenantId / -d365AppId override when D365 authenticates as a different principal.
-    $expectedTenant = if ($d365TenantId) { $d365TenantId } else { az account show --query tenantId --output tsv }
-    $expectedAppId = if ($d365AppId) { $d365AppId } elseif ($appId) { $appId } elseif ($AADApplicationName) { az ad app list --display-name $AADApplicationName --query "[0].appId" --output tsv }
-
-    if ($expectedTenant -and $expectedAppId) {
-        $settings += "RELAY_EXPECTED_TENANT_ID=$expectedTenant"
-        $settings += "RELAY_EXPECTED_APP_ID=$expectedAppId"
-    }
-    else {
-        Write-Warning "Could not determine the relay's expected tenant/app id; it will reject D365 calls until RELAY_EXPECTED_TENANT_ID and RELAY_EXPECTED_APP_ID are set (re-run with -d365TenantId and -d365AppId, or -AADApplicationName)."
-    }
-
     az functionapp config appsettings set --name $functionAppName --resource-group $resourceGroupName --settings $settings | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "Could not configure the relay's pinned caller identity; deployment stopped." }
 }
 
 function Deploy-Relay {
@@ -474,6 +816,7 @@ function Deploy-Relay {
 }
 
 function Ensure-Relay {
+    Assert-RelayCaller
     Ensure-FunctionStorage
     Ensure-FunctionApp
     Ensure-FunctionIdentityAndRoles
@@ -490,28 +833,36 @@ function Display-RelayResult {
 
 $ErrorActionPreference = "Stop"
 
+Read-SetupIdentityInputs
+Check-IdentityInputs
+
 #check azure client and extension versions
 Check-AzureClientVersion
 
 # login to azure
 Write-Host "Please log in with your Azure credentials..."
 az login
+if ($LASTEXITCODE -ne 0) { throw "Azure login failed." }
 
 # check and set the subscription
 Set-SubscriptionContext
 
-if ($RelayOnly) {
-    # Idempotent relay (re)deploy only; the AML workspace must already exist.
-    Ensure-Relay
-    Display-RelayResult
-    return
-}
-
-# check script parameters
-Check-InputParams
-
 try
 {
+    if (-not $RelayOnly) {
+        Check-InputParams
+        # Resolve the forecast identity before provisioning resources or granting roles.
+        Create-AppWithPrincipal
+    }
+    Resolve-RelayCaller
+
+    if ($RelayOnly) {
+        # The AML workspace must already exist.
+        Ensure-Relay
+        Display-RelayResult
+        return
+    }
+
     # create a resource group
     Create-ResourceGroup
 
@@ -527,8 +878,8 @@ try
     # create workspace compute cluster
     Create-ComputeCluster
 
-    # create AAD application for forecast access
-    Create-AppWithPrincipal
+    # grant the verified service principal access to the intended resources
+    Grant-ForecastAppRoles
 
     # provision and deploy the relay Function (idempotent)
     Ensure-Relay
@@ -538,6 +889,6 @@ try
 }
 catch
 {
-    Write-Warning "Setup did not complete: $($_.Exception.Message)`nThe script is idempotent - fix the issue and re-run; existing resources are reused (nothing is deleted)."
+    Write-Warning "Setup did not complete: $($_.Exception.Message)`nFix the issue and rerun; if an application was created, reuse its printed client ID with -AADApplicationId. Existing Azure resources are reused (nothing is deleted)."
     throw
 }
